@@ -1,0 +1,23 @@
+name = "telegram-workflow-bot"
+main = "src/index.js"
+compatibility_date = "2026-07-01"
+
+[vars]
+GITHUB_OWNER = "quickerup"
+GITHUB_REPO = "telegram-workflow-bot"
+# Comma-separated Telegram chat IDs allowed to trigger workflows.
+# Leave empty to allow anyone who messages the bot (NOT recommended).
+ALLOWED_CHAT_IDS = "8492548344"
+
+# KV namespace used for: (a) staging a workflow between "file received" and
+# "/confirm", and (b) deduping Telegram update_ids so a webhook retry can't
+# double-run a workflow. Create it with `wrangler kv namespace create
+# WORKFLOW_STATE` (deploy.sh does this for you) and paste the id below.
+[[kv_namespaces]]
+binding = "WORKFLOW_STATE"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Secrets — set these with `wrangler secret put <NAME>`, never write real values here:
+#   TELEGRAM_BOT_TOKEN      (from @BotFather)
+#   TELEGRAM_WEBHOOK_SECRET (random string you choose)
+#   GITHUB_PAT              (fine-grained PAT with contents:write on this repo)

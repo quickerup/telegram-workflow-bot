@@ -1,0 +1,14 @@
+{
+  "name": "telegram-workflow-bot",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "setup": "bash deploy.sh"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}

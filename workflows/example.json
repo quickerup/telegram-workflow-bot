@@ -1,0 +1,10 @@
+{
+  "$schema": "./workflow.schema.json",
+  "name": "hello-world",
+  "steps": [
+    { "type": "run", "command": "echo 'Hello from GitHub Actions!' && date -u" },
+    { "type": "http", "method": "GET", "url": "https://api.github.com/zen" },
+    { "type": "delay", "ms": 1000 },
+    { "type": "notify", "message": "hello-world workflow reached its final step" }
+  ]
+}

@@ -1,0 +1,91 @@
+name: Workflow Executor
+
+on:
+  repository_dispatch:
+    types: [run-workflow]
+  workflow_dispatch:
+    inputs:
+      payload_json:
+        description: 'Full workflow JSON (for manual test runs without Telegram)'
+        required: false
+        default: '{"name":"manual-test","steps":[{"type":"run","command":"echo manual run"}]}'
+
+concurrency:
+  group: workflow-executor
+  cancel-in-progress: false
+
+jobs:
+  execute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Write payload to file (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          cat > payload.json << 'PAYLOAD_EOF'
+          ${{ toJson(github.event.client_payload) }}
+          PAYLOAD_EOF
+
+      - name: Write payload to file (workflow_dispatch / manual)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo '${{ inputs.payload_json }}' > payload.json
+
+      - name: Extract and validate workflow
+        run: |
+          node -e "
+            const fs = require('fs');
+            const raw = JSON.parse(fs.readFileSync('payload.json', 'utf8'));
+            const workflow = raw.payload || raw;
+            fs.writeFileSync('workflow.json', JSON.stringify(workflow));
+          "
+          node scripts/validate.js workflow.json
+
+      - name: Notify start
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          CHAT_ID=$(node -e "try{const d=JSON.parse(require('fs').readFileSync('payload.json'));console.log(d.chat_id||'')}catch(e){}")
+          if [ -n "$CHAT_ID" ] && [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${CHAT_ID}" \
+              -d text="Workflow run started..." > /dev/null
+          fi
+
+      - name: Run executor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: node scripts/executor.js payload.json
+
+      - name: Commit execution log
+        if: always()
+        run: |
+          git config user.name "workflow-bot"
+          git config user.email "workflow-bot@users.noreply.github.com"
+          git add executions/
+          git diff --cached --quiet || git commit -m "Log execution [skip ci]"
+          git push
+
+      - name: Notify Telegram (final result)
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          CHAT_ID=$(node -e "try{const d=JSON.parse(require('fs').readFileSync('payload.json'));console.log(d.chat_id||'')}catch(e){}")
+          STATUS="${{ job.status }}"
+          if [ -n "$CHAT_ID" ] && [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${CHAT_ID}" \
+              -d text="Workflow run finished with status: ${STATUS}"
+          fi

@@ -1,0 +1,34 @@
+name: Lint Workflow Definitions
+
+on:
+  pull_request:
+    paths:
+      - 'workflows/**.json'
+  push:
+    paths:
+      - 'workflows/**.json'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Validate every workflow file
+        run: |
+          shopt -s nullglob
+          files=(workflows/*.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No workflow files to validate."
+            exit 0
+          fi
+          status=0
+          for f in "${files[@]}"; do
+            [[ "$f" == *"workflow.schema.json" ]] && continue
+            echo "::group::$f"
+            node scripts/validate.js "$f" || status=1
+            echo "::endgroup::"
+          done
+          exit $status
