@@ -162,6 +162,30 @@ export default {
       }
     }
 
+    // GET /api/test-get-pending/:chatId
+    if (url.pathname.startsWith('/api/test-get-pending/') && request.method === 'GET') {
+      const parts = url.pathname.split('/');
+      const chatId = parts[3];
+      try {
+        const raw = await env.WORKFLOW_STATE.get(`pending:${chatId}`);
+        if (!raw) {
+          return new Response(JSON.stringify({ ok: false, error: 'No pending workflow for this chat' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(raw, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: err.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
     // GET /api/workflows
     if (url.pathname === '/api/workflows' && request.method === 'GET') {
       try {
@@ -714,7 +738,10 @@ export default {
     }
 
     try {
-      if (message.document) {
+      if (callbackQuery) {
+        await answerCallbackQuery(env, callbackQuery.id);
+        await handleBuilderCallback(env, chatId, callbackQuery);
+      } else if (message.document) {
         await handleDocument(message, env, chatId);
       } else if (message.text && message.text.startsWith('/confirm')) {
         await handleConfirm(env, chatId, message.text, request.url);
@@ -726,10 +753,18 @@ export default {
           `Your Telegram chat ID is: ${chatId}\n` +
           `Add it to ALLOWED_CHAT_IDS in wrangler.toml if it isn't already, then redeploy.`
         );
-      } else if (message.text) {
-        await sendMessage(env, chatId,
-          "Send me a workflow as a .json file attachment. I'll validate it and show you " +
-          "a summary — nothing runs until you reply /confirm <token>. Send /whoami to see your chat ID.");
+      } else if (message.text && message.text.startsWith('/newworkflow')) {
+        await handleNewWorkflow(env, chatId, message.text);
+      } else {
+        const handled = await handleBuilderState(env, chatId, message.text);
+        if (!handled) {
+          if (message.text) {
+            await sendMessage(env, chatId,
+              "Send me a workflow as a .json file attachment. I'll validate it and show you " +
+              "a summary — nothing runs until you reply /confirm <token>. Send /whoami to see your chat ID.\n\n" +
+              "Or design a workflow directly in Telegram using: /newworkflow");
+          }
+        }
       }
     } catch (err) {
       await sendMessage(env, chatId, `Error: ${err.message}`);
@@ -1136,6 +1171,7 @@ async function handleConfirm(env, chatId, text, requestUrl) {
 
 async function handleCancel(env, chatId) {
   await env.WORKFLOW_STATE.delete(`pending:${chatId}`);
+  await env.WORKFLOW_STATE.delete(`builder:${chatId}`);
   await sendMessage(env, chatId, 'Discarded.');
 }
 
@@ -1168,13 +1204,40 @@ async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl, t
   }
 }
 
-async function sendMessage(env, chatId, text) {
+async function sendMessage(env, chatId, text, replyMarkup = null) {
   if (!env.TELEGRAM_BOT_TOKEN) return;
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text }),
-  });
+  const body = { chat_id: chatId, text };
+  if (replyMarkup) {
+    body.reply_markup = replyMarkup;
+  }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      console.error(`Telegram sendMessage failed with status ${res.status}: ${await res.text()}`);
+    }
+  } catch (err) {
+    console.error(`Telegram sendMessage network error: ${err.message}`);
+  }
+}
+
+async function answerCallbackQuery(env, callbackQueryId) {
+  if (!env.TELEGRAM_BOT_TOKEN) return;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId }),
+    });
+    if (!res.ok) {
+      console.error(`Telegram answerCallbackQuery failed with status ${res.status}: ${await res.text()}`);
+    }
+  } catch (err) {
+    console.error(`Telegram answerCallbackQuery network error: ${err.message}`);
+  }
 }
 
 // Constant-time string compare — used for the webhook secret and the
