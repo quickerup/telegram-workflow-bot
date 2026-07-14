@@ -1,4 +1,4 @@
-const ALLOWED_STEP_TYPES = new Set(['run', 'http', 'delay', 'notify']);
+const ALLOWED_STEP_TYPES = new Set(['run', 'http', 'delay', 'notify', 'webhook_trigger', 'cron_trigger', 'telegram_event_trigger']);
 const MAX_NODES = 50;
 const MAX_FILE_SIZE_BYTES = 200_000; // 200 KB — plenty for a workflow definition
 const CONFIRM_TTL_SECONDS = 300; // pending workflows expire after 5 minutes
@@ -7,6 +7,110 @@ const DEDUPE_TTL_SECONDS = 3600; // remember update_ids for an hour
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // POST /webhooks/:id
+    if (request.method === 'POST' && url.pathname.startsWith('/webhooks/')) {
+      const parts = url.pathname.split('/');
+      if (parts.length === 3) {
+        const id = parts[2];
+        try {
+          if (!env.DB) {
+            throw new Error('Database is not configured');
+          }
+
+          const workflowRow = await env.DB.prepare(
+            `SELECT id, name FROM workflows WHERE id = ?`
+          ).bind(id).first();
+
+          if (!workflowRow) {
+            return new Response(JSON.stringify({ ok: false, error: 'Workflow not found' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const { results: nodesRows } = await env.DB.prepare(
+            `SELECT id, type, position_x, position_y, config FROM nodes WHERE workflow_id = ?`
+          ).bind(id).all();
+
+          // Check if there is a webhook_trigger node
+          const hasWebhookTrigger = nodesRows.some(row => row.type === 'webhook_trigger');
+          if (!hasWebhookTrigger) {
+            return new Response(JSON.stringify({ ok: false, error: 'Workflow does not have a webhook trigger' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const { results: edgesRows } = await env.DB.prepare(
+            `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
+          ).bind(id).all();
+
+          const nodes = nodesRows.map(row => ({
+            id: row.id,
+            type: row.type,
+            position: { x: row.position_x, y: row.position_y },
+            config: JSON.parse(row.config)
+          }));
+
+          const edges = edgesRows.map(row => ({
+            source: row.source,
+            target: row.target,
+            sourceHandle: row.source_handle || 'success'
+          }));
+
+          const workflowObj = {
+            id: workflowRow.id,
+            name: workflowRow.name,
+            nodes,
+            edges
+          };
+
+          const executionId = crypto.randomUUID();
+
+          await env.DB.prepare(
+            `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+          ).bind(
+            executionId,
+            id,
+            new Date().toISOString()
+          ).run();
+
+          // Get chat ID from optional body or default to ALLOWED_CHAT_IDS
+          let chatId = null;
+          let triggerPayload = null;
+          try {
+            triggerPayload = await request.json().catch(() => null);
+            if (triggerPayload && triggerPayload.chat_id) {
+              chatId = triggerPayload.chat_id;
+            }
+          } catch (e) {}
+
+          if (!chatId) {
+            const allowList = (env.ALLOWED_CHAT_IDS || '')
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean);
+            if (allowList.length > 0) {
+              chatId = allowList[0];
+            }
+          }
+
+          const workerUrl = `${url.protocol}//${url.host}`;
+          await dispatchWorkflow(env, workflowObj, chatId, executionId, workerUrl, triggerPayload);
+
+          return new Response(JSON.stringify({ ok: true, execution_id: executionId }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ ok: false, error: err.message }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+    }
 
     // Support execution feedback API: POST /executions/:id
     if (request.method === 'POST' && url.pathname.startsWith('/executions/')) {
@@ -496,6 +600,100 @@ export default {
       await env.WORKFLOW_STATE.put(dedupeKey, '1', { expirationTtl: DEDUPE_TTL_SECONDS });
     }
 
+    // --- Telegram Event Triggers ---
+    if (env.DB) {
+      try {
+        const { results: workflows } = await env.DB.prepare(
+          `SELECT id, name FROM workflows`
+        ).all();
+
+        for (const wf of workflows) {
+          const { results: nodesRows } = await env.DB.prepare(
+            `SELECT id, type, config FROM nodes WHERE workflow_id = ?`
+          ).bind(wf.id).all();
+
+          const eventTriggers = nodesRows.filter(row => row.type === 'telegram_event_trigger');
+          if (eventTriggers.length === 0) continue;
+
+          let shouldTrigger = false;
+          for (const trigger of eventTriggers) {
+            const config = JSON.parse(trigger.config);
+            if (config && config.event_type) {
+              const eventTypes = Array.isArray(config.event_type) ? config.event_type : [config.event_type];
+              if (eventTypes.some(et => matchTelegramEvent(update, et))) {
+                shouldTrigger = true;
+                break;
+              }
+            }
+          }
+
+          if (shouldTrigger) {
+            const { results: edgesRows } = await env.DB.prepare(
+              `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
+            ).bind(wf.id).all();
+
+            const nodes = nodesRows.map(row => ({
+              id: row.id,
+              type: row.type,
+              position: { x: 0, y: 0 },
+              config: JSON.parse(row.config)
+            }));
+
+            const edges = edgesRows.map(row => ({
+              source: row.source,
+              target: row.target,
+              sourceHandle: row.source_handle || 'success'
+            }));
+
+            const workflowObj = {
+              id: wf.id,
+              name: wf.name,
+              nodes,
+              edges
+            };
+
+            const executionId = crypto.randomUUID();
+
+            await env.DB.prepare(
+              `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+            ).bind(
+              executionId,
+              wf.id,
+              new Date().toISOString()
+            ).run();
+
+            let chatId = null;
+            if (update.message && update.message.chat) {
+              chatId = update.message.chat.id;
+            } else if (update.edited_message && update.edited_message.chat) {
+              chatId = update.edited_message.chat.id;
+            } else if (update.my_chat_member && update.my_chat_member.chat) {
+              chatId = update.my_chat_member.chat.id;
+            } else if (update.chat_member && update.chat_member.chat) {
+              chatId = update.chat_member.chat.id;
+            } else if (update.chat_join_request && update.chat_join_request.chat) {
+              chatId = update.chat_join_request.chat.id;
+            }
+
+            if (!chatId) {
+              const allowList = (env.ALLOWED_CHAT_IDS || '')
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+              if (allowList.length > 0) {
+                chatId = allowList[0];
+              }
+            }
+
+            const workerUrl = `${url.protocol}//${url.host}`;
+            await dispatchWorkflow(env, workflowObj, chatId, executionId, workerUrl, { telegram_update: update });
+          }
+        }
+      } catch (err) {
+        console.error('Error matching telegram_event_trigger:', err);
+      }
+    }
+
     const message = update.message;
     if (!message) return new Response('OK');
 
@@ -538,6 +736,90 @@ export default {
     }
 
     return new Response('OK');
+  },
+
+  async scheduled(event, env, ctx) {
+    if (!env.DB) {
+      console.error('Database is not configured');
+      return;
+    }
+
+    try {
+      const date = new Date(event.scheduledTime || Date.now());
+
+      const { results: workflows } = await env.DB.prepare(
+        `SELECT id, name FROM workflows`
+      ).all();
+
+      for (const wf of workflows) {
+        const { results: nodesRows } = await env.DB.prepare(
+          `SELECT id, type, config FROM nodes WHERE workflow_id = ?`
+        ).bind(wf.id).all();
+
+        // Check if there are cron_trigger nodes
+        const cronTriggers = nodesRows.filter(row => row.type === 'cron_trigger');
+        if (cronTriggers.length === 0) continue;
+
+        let shouldTrigger = false;
+        for (const trigger of cronTriggers) {
+          const config = JSON.parse(trigger.config);
+          if (config && config.cron && matchCron(config.cron, date)) {
+            shouldTrigger = true;
+            break;
+          }
+        }
+
+        if (shouldTrigger) {
+          const { results: edgesRows } = await env.DB.prepare(
+            `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
+          ).bind(wf.id).all();
+
+          const nodes = nodesRows.map(row => ({
+            id: row.id,
+            type: row.type,
+            position: { x: 0, y: 0 },
+            config: JSON.parse(row.config)
+          }));
+
+          const edges = edgesRows.map(row => ({
+            source: row.source,
+            target: row.target,
+            sourceHandle: row.source_handle || 'success'
+          }));
+
+          const workflowObj = {
+            id: wf.id,
+            name: wf.name,
+            nodes,
+            edges
+          };
+
+          const executionId = crypto.randomUUID();
+
+          await env.DB.prepare(
+            `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+          ).bind(
+            executionId,
+            wf.id,
+            new Date().toISOString()
+          ).run();
+
+          let chatId = null;
+          const allowList = (env.ALLOWED_CHAT_IDS || '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
+          if (allowList.length > 0) {
+            chatId = allowList[0];
+          }
+
+          const workerUrl = env.WORKER_URL || 'http://localhost:8787';
+          await dispatchWorkflow(env, workflowObj, chatId, executionId, workerUrl, { scheduled_time: date.toISOString() });
+        }
+      }
+    } catch (err) {
+      console.error('Error during scheduled execution:', err);
+    }
   },
 };
 
@@ -611,6 +893,14 @@ function validateWorkflow(workflow) {
     }
     if (node.type === 'notify' && typeof config.message !== 'string') {
       errors.push(`node ${i} (${node.id || 'unnamed'}): "notify" config needs a string "message"`);
+    }
+    if (node.type === 'cron_trigger' && typeof config.cron !== 'string') {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "cron_trigger" config needs a string "cron"`);
+    }
+    if (node.type === 'telegram_event_trigger') {
+      if (typeof config.event_type !== 'string' && !Array.isArray(config.event_type)) {
+        errors.push(`node ${i} (${node.id || 'unnamed'}): "telegram_event_trigger" config needs a string or array "event_type"`);
+      }
     }
   });
 
@@ -849,7 +1139,7 @@ async function handleCancel(env, chatId) {
   await sendMessage(env, chatId, 'Discarded.');
 }
 
-async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl) {
+async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl, triggerPayload = null) {
   const res = await fetch(
     `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/dispatches`,
     {
@@ -866,7 +1156,8 @@ async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl) {
           payload: workflow,
           chat_id: chatId,
           execution_id: executionId,
-          worker_url: workerUrl
+          worker_url: workerUrl,
+          trigger_payload: triggerPayload
         },
       }),
     }
@@ -942,4 +1233,115 @@ async function executeSimpleNodeInWorker(env, node, chatId) {
   }
   entry.finished_at = new Date().toISOString();
   return entry;
+}
+
+function matchCron(cron, date) {
+  const fields = cron.trim().split(/\s+/);
+  if (fields.length !== 5) return false;
+
+  const mins = date.getUTCMinutes();
+  const hours = date.getUTCHours();
+  const dayOfMonth = date.getUTCDate();
+  const month = date.getUTCMonth() + 1; // getUTCMonth is 0-indexed (0 = January)
+  const dayOfWeek = date.getUTCDay(); // 0 = Sunday
+
+  const matchField = (field, value, minVal, maxVal) => {
+    if (field === '*') return true;
+
+    // Normalize dayOfWeek: 7 becomes 0
+    if (maxVal === 6 && field === '7') {
+      field = '0';
+    }
+
+    // Handle comma-separated values
+    const parts = field.split(',');
+    if (parts.length > 1) {
+      return parts.some(p => matchField(p, value, minVal, maxVal));
+    }
+
+    // Handle step values, e.g., */5 or 1-10/2
+    if (field.includes('/')) {
+      const [range, stepStr] = field.split('/');
+      const step = parseInt(stepStr, 10);
+      if (isNaN(step)) return false;
+
+      let start = minVal;
+      let end = maxVal;
+      if (range !== '*') {
+        if (range.includes('-')) {
+          const [startStr, endStr] = range.split('-');
+          start = parseInt(startStr, 10);
+          end = parseInt(endStr, 10);
+        } else {
+          start = parseInt(range, 10);
+        }
+      }
+      if (isNaN(start) || isNaN(end)) return false;
+      if (value < start || value > end) return false;
+      return (value - start) % step === 0;
+    }
+
+    // Handle ranges, e.g., 1-5
+    if (field.includes('-')) {
+      const [startStr, endStr] = field.split('-');
+      const start = parseInt(startStr, 10);
+      const end = parseInt(endStr, 10);
+      if (isNaN(start) || isNaN(end)) return false;
+      return value >= start && value <= end;
+    }
+
+    // Handle single number
+    const num = parseInt(field, 10);
+    return num === value;
+  };
+
+  return (
+    matchField(fields[0], mins, 0, 59) &&
+    matchField(fields[1], hours, 0, 23) &&
+    matchField(fields[2], dayOfMonth, 1, 31) &&
+    matchField(fields[3], month, 1, 12) &&
+    matchField(fields[4], dayOfWeek, 0, 6)
+  );
+}
+
+function matchTelegramEvent(update, eventType) {
+  if (!update) return false;
+
+  const type = eventType.toLowerCase();
+
+  if (type === 'edited_message') {
+    return !!update.edited_message;
+  }
+  if (type === 'new_chat_members') {
+    return !!(update.message && update.message.new_chat_members);
+  }
+  if (type === 'left_chat_member') {
+    return !!(update.message && update.message.left_chat_member);
+  }
+  if (type === 'callback_query') {
+    return !!update.callback_query;
+  }
+  if (type === 'inline_query') {
+    return !!update.inline_query;
+  }
+  if (type === 'poll') {
+    return !!update.poll;
+  }
+  if (type === 'poll_answer') {
+    return !!update.poll_answer;
+  }
+  if (type === 'chat_member') {
+    return !!update.chat_member;
+  }
+  if (type === 'my_chat_member') {
+    return !!update.my_chat_member;
+  }
+  if (type === 'chat_join_request') {
+    return !!update.chat_join_request;
+  }
+  if (type === 'message') {
+    return !!update.message;
+  }
+
+  return false;
 }

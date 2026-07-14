@@ -28,7 +28,7 @@
           },
           "type": {
             "type": "string",
-            "enum": ["run", "http", "delay", "notify"]
+            "enum": ["run", "http", "delay", "notify", "webhook_trigger", "cron_trigger", "telegram_event_trigger"]
           },
           "position": {
             "type": "object",
@@ -116,6 +116,60 @@
                   "additionalProperties": false,
                   "properties": {
                     "message": { "type": "string" },
+                    "continue_on_error": { "type": "boolean" }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "type": { "const": "webhook_trigger" } } },
+            "then": {
+              "properties": {
+                "config": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "continue_on_error": { "type": "boolean" }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "type": { "const": "cron_trigger" } } },
+            "then": {
+              "properties": {
+                "config": {
+                  "type": "object",
+                  "required": ["cron"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "cron": { "type": "string" },
+                    "continue_on_error": { "type": "boolean" }
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": { "properties": { "type": { "const": "telegram_event_trigger" } } },
+            "then": {
+              "properties": {
+                "config": {
+                  "type": "object",
+                  "required": ["event_type"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "event_type": {
+                      "oneOf": [
+                        { "type": "string" },
+                        {
+                          "type": "array",
+                          "items": { "type": "string" }
+                        }
+                      ]
+                    },
                     "continue_on_error": { "type": "boolean" }
                   }
                 }
