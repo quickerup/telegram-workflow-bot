@@ -17,6 +17,11 @@ ALLOWED_CHAT_IDS = "8492548344"
 binding = "WORKFLOW_STATE"
 id = "REPLACE_WITH_KV_NAMESPACE_ID"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "telegram-workflow-bot-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
 # Secrets — set these with `wrangler secret put <NAME>`, never write real values here:
 #   TELEGRAM_BOT_TOKEN      (from @BotFather)
 #   TELEGRAM_WEBHOOK_SECRET (random string you choose)
