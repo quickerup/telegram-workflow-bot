@@ -154,8 +154,8 @@ async function request(options, body = null) {
     }
     console.log('Test 3 passed!');
 
-    // 4. Test saving a valid workflow
-    console.log('Test 4: POST /api/workflows with a valid DAG...');
+    // 4. Test saving a valid workflow with inputs and outputs
+    console.log('Test 4: POST /api/workflows with a valid DAG (including inputs/outputs)...');
     const testWorkflow = {
       name: "API Test Workflow",
       nodes: [
@@ -169,7 +169,13 @@ async function request(options, body = null) {
           id: "node_notify",
           type: "notify",
           position: { x: 300, y: 150 },
-          config: { message: "Hello from test!" }
+          inputs: {
+            custom_input: "Testing inputs"
+          },
+          outputs: {
+            custom_output: "Testing outputs"
+          },
+          config: { message: "Hello from test! Input: {{ nodes.node_delay.outputs.ms }}" }
         },
         {
           id: "node_run",
@@ -226,6 +232,13 @@ async function request(options, body = null) {
     }
     if (resGet.body.name !== "API Test Workflow" || resGet.body.nodes.length !== 3) {
       throw new Error('Retrieved workflow structure mismatch');
+    }
+    const notifyNode = resGet.body.nodes.find(n => n.id === 'node_notify');
+    if (!notifyNode || !notifyNode.inputs || notifyNode.inputs.custom_input !== "Testing inputs") {
+      throw new Error('Retrieved node is missing expected inputs');
+    }
+    if (!notifyNode.outputs || notifyNode.outputs.custom_output !== "Testing outputs") {
+      throw new Error('Retrieved node is missing expected outputs');
     }
     console.log('Test 5 passed!');
 

@@ -19,6 +19,8 @@ CREATE TABLE nodes (
     position_x REAL NOT NULL,
     position_y REAL NOT NULL,
     config TEXT NOT NULL, -- JSON string
+    inputs TEXT,          -- JSON string (optional inputs)
+    outputs TEXT,         -- JSON string (optional outputs)
     PRIMARY KEY (workflow_id, id),
     FOREIGN KEY (workflow_id) REFERENCES workflows(id) ON DELETE CASCADE
 );

@@ -42,6 +42,14 @@
           "config": {
             "type": "object",
             "description": "Configuration specific to the node type"
+          },
+          "inputs": {
+            "type": "object",
+            "description": "Inputs to the node, potentially referencing outputs of other nodes"
+          },
+          "outputs": {
+            "type": "object",
+            "description": "Declared schema/defaults for outputs of the node"
           }
         },
         "allOf": [

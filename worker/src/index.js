@@ -100,19 +100,28 @@ export default {
           }
 
           const { results: nodesRows } = await env.DB.prepare(
-            `SELECT id, type, position_x, position_y, config FROM nodes WHERE workflow_id = ?`
+            `SELECT id, type, position_x, position_y, config, inputs, outputs FROM nodes WHERE workflow_id = ?`
           ).bind(id).all();
 
           const { results: edgesRows } = await env.DB.prepare(
             `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
           ).bind(id).all();
 
-          const nodes = nodesRows.map(row => ({
-            id: row.id,
-            type: row.type,
-            position: { x: row.position_x, y: row.position_y },
-            config: JSON.parse(row.config)
-          }));
+          const nodes = nodesRows.map(row => {
+            const nodeObj = {
+              id: row.id,
+              type: row.type,
+              position: { x: row.position_x, y: row.position_y },
+              config: JSON.parse(row.config)
+            };
+            if (row.inputs !== null && row.inputs !== undefined) {
+              nodeObj.inputs = JSON.parse(row.inputs);
+            }
+            if (row.outputs !== null && row.outputs !== undefined) {
+              nodeObj.outputs = JSON.parse(row.outputs);
+            }
+            return nodeObj;
+          });
 
           const edges = edgesRows.map(row => ({
             source: row.source,
@@ -182,10 +191,12 @@ export default {
         for (const node of workflow.nodes) {
           const posX = (node.position && typeof node.position.x === 'number') ? node.position.x : 0;
           const posY = (node.position && typeof node.position.y === 'number') ? node.position.y : 0;
+          const inputsStr = node.inputs ? JSON.stringify(node.inputs) : null;
+          const outputsStr = node.outputs ? JSON.stringify(node.outputs) : null;
           statements.push(
             env.DB.prepare(
-              `INSERT INTO nodes (id, workflow_id, type, position_x, position_y, config) VALUES (?, ?, ?, ?, ?, ?)`
-            ).bind(node.id, workflowId, node.type, posX, posY, JSON.stringify(node.config || {}))
+              `INSERT INTO nodes (id, workflow_id, type, position_x, position_y, config, inputs, outputs) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            ).bind(node.id, workflowId, node.type, posX, posY, JSON.stringify(node.config || {}), inputsStr, outputsStr)
           );
         }
 
@@ -205,12 +216,17 @@ export default {
           workflow: {
             id: workflowId,
             name: workflow.name,
-            nodes: workflow.nodes.map(n => ({
-              id: n.id,
-              type: n.type,
-              position: n.position || { x: 0, y: 0 },
-              config: n.config || {}
-            })),
+            nodes: workflow.nodes.map(n => {
+              const resNode = {
+                id: n.id,
+                type: n.type,
+                position: n.position || { x: 0, y: 0 },
+                config: n.config || {}
+              };
+              if (n.inputs) resNode.inputs = n.inputs;
+              if (n.outputs) resNode.outputs = n.outputs;
+              return resNode;
+            }),
             edges: edges.map(e => ({
               source: e.source,
               target: e.target,
@@ -251,19 +267,28 @@ export default {
           }
 
           const { results: nodesRows } = await env.DB.prepare(
-            `SELECT id, type, position_x, position_y, config FROM nodes WHERE workflow_id = ?`
+            `SELECT id, type, position_x, position_y, config, inputs, outputs FROM nodes WHERE workflow_id = ?`
           ).bind(id).all();
 
           const { results: edgesRows } = await env.DB.prepare(
             `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
           ).bind(id).all();
 
-          const nodes = nodesRows.map(row => ({
-            id: row.id,
-            type: row.type,
-            position: { x: row.position_x, y: row.position_y },
-            config: JSON.parse(row.config)
-          }));
+          const nodes = nodesRows.map(row => {
+            const nodeObj = {
+              id: row.id,
+              type: row.type,
+              position: { x: row.position_x, y: row.position_y },
+              config: JSON.parse(row.config)
+            };
+            if (row.inputs !== null && row.inputs !== undefined) {
+              nodeObj.inputs = JSON.parse(row.inputs);
+            }
+            if (row.outputs !== null && row.outputs !== undefined) {
+              nodeObj.outputs = JSON.parse(row.outputs);
+            }
+            return nodeObj;
+          });
 
           const edges = edgesRows.map(row => ({
             source: row.source,
@@ -345,7 +370,7 @@ export default {
           }
 
           const nodeRow = await env.DB.prepare(
-            `SELECT id, type, position_x, position_y, config FROM nodes WHERE workflow_id = ? AND id = ?`
+            `SELECT id, type, position_x, position_y, config, inputs, outputs FROM nodes WHERE workflow_id = ? AND id = ?`
           ).bind(id, nodeId).first();
 
           if (!nodeRow) {
@@ -361,6 +386,12 @@ export default {
             position: { x: nodeRow.position_x, y: nodeRow.position_y },
             config: JSON.parse(nodeRow.config)
           };
+          if (nodeRow.inputs !== null && nodeRow.inputs !== undefined) {
+            node.inputs = JSON.parse(nodeRow.inputs);
+          }
+          if (nodeRow.outputs !== null && nodeRow.outputs !== undefined) {
+            node.outputs = JSON.parse(nodeRow.outputs);
+          }
 
           // Get chat ID from optional body or default to ALLOWED_CHAT_IDS
           let chatId = null;
@@ -553,6 +584,14 @@ function validateWorkflow(workflow) {
       if (typeof node.position.x !== 'number' || typeof node.position.y !== 'number') {
         errors.push(`node ${i} (${node.id || 'unnamed'}): position "x" and "y" must be numbers`);
       }
+    }
+
+    if (node.inputs !== undefined && (typeof node.inputs !== 'object' || node.inputs === null)) {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "inputs" must be an object`);
+    }
+
+    if (node.outputs !== undefined && (typeof node.outputs !== 'object' || node.outputs === null)) {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "outputs" must be an object`);
     }
 
     if (!node.config || typeof node.config !== 'object') {
@@ -748,15 +787,19 @@ async function handleConfirm(env, chatId, text, requestUrl) {
 
     // Insert new nodes
     const nodeStmts = workflow.nodes.map(node => {
+      const inputsStr = node.inputs ? JSON.stringify(node.inputs) : null;
+      const outputsStr = node.outputs ? JSON.stringify(node.outputs) : null;
       return env.DB.prepare(
-        `INSERT INTO nodes (id, workflow_id, type, position_x, position_y, config) VALUES (?, ?, ?, ?, ?, ?)`
+        `INSERT INTO nodes (id, workflow_id, type, position_x, position_y, config, inputs, outputs) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
         node.id,
         workflowId,
         node.type,
         node.position.x,
         node.position.y,
-        JSON.stringify(node.config)
+        JSON.stringify(node.config),
+        inputsStr,
+        outputsStr
       );
     });
 
