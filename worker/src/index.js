@@ -58,6 +58,30 @@ export default {
       }
     }
 
+    // GET /api/test-get-pending/:chatId
+    if (url.pathname.startsWith('/api/test-get-pending/') && request.method === 'GET') {
+      const parts = url.pathname.split('/');
+      const chatId = parts[3];
+      try {
+        const raw = await env.WORKFLOW_STATE.get(`pending:${chatId}`);
+        if (!raw) {
+          return new Response(JSON.stringify({ ok: false, error: 'No pending workflow for this chat' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(raw, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: err.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
     // GET /api/workflows
     if (url.pathname === '/api/workflows' && request.method === 'GET') {
       try {
@@ -894,6 +918,12 @@ async function handleBuilderCallback(env, chatId, callbackQuery) {
     return;
   }
 
+  // Reject action buttons if they are clicked out-of-order/stale while in the middle of configuring a node
+  if ((data === 'builder:add_node' || data === 'builder:finish') && state.state !== 'AWAITING_NEXT_ACTION') {
+    await sendMessage(env, chatId, "⚠️ Please finish configuring the current node first or cancel the builder with /cancel.");
+    return;
+  }
+
   if (data === 'builder:add_node') {
     state.state = 'AWAITING_NODE_TYPE';
     await setBuilderState(env, chatId, state);
@@ -944,6 +974,11 @@ async function handleBuilderCallback(env, chatId, callbackQuery) {
 async function handleBuilderState(env, chatId, text) {
   const state = await getBuilderState(env, chatId);
   if (!state) return false;
+
+  if (typeof text !== 'string' || !text) {
+    await sendMessage(env, chatId, "⚠️ Unexpected message type. Please enter text configuration or /cancel.");
+    return true; // We handled/consumed it so it doesn't trigger the default help text
+  }
 
   if (state.state === 'AWAITING_NAME') {
     const name = text.trim();
@@ -1084,14 +1119,15 @@ async function finalizeAndStageWorkflow(env, chatId, state) {
     { expirationTtl: CONFIRM_TTL_SECONDS }
   );
 
-  await clearBuilderState(env, chatId);
-
   const summary = summarizeWorkflow(workflow);
   await sendMessage(
     env, chatId,
     `Workflow builder finished! Staged "${workflow.name}" (${workflow.nodes.length} node(s)):\n\n${summary}\n\n` +
     `Reply "/confirm ${token}" within ${CONFIRM_TTL_SECONDS / 60} minutes to run it, or /cancel to discard.`
   );
+
+  // Clear builder state only after the staging and confirmation message is successful
+  await clearBuilderState(env, chatId);
 }
 
 async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl) {
@@ -1128,20 +1164,34 @@ async function sendMessage(env, chatId, text, replyMarkup = null) {
   if (replyMarkup) {
     body.reply_markup = replyMarkup;
   }
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      console.error(`Telegram sendMessage failed with status ${res.status}: ${await res.text()}`);
+    }
+  } catch (err) {
+    console.error(`Telegram sendMessage network error: ${err.message}`);
+  }
 }
 
 async function answerCallbackQuery(env, callbackQueryId) {
   if (!env.TELEGRAM_BOT_TOKEN) return;
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ callback_query_id: callbackQueryId }),
-  });
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callback_query_id: callbackQueryId }),
+    });
+    if (!res.ok) {
+      console.error(`Telegram answerCallbackQuery failed with status ${res.status}: ${await res.text()}`);
+    }
+  } catch (err) {
+    console.error(`Telegram answerCallbackQuery network error: ${err.message}`);
+  }
 }
 
 // Constant-time string compare — used for the webhook secret and the
