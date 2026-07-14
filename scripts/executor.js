@@ -11,7 +11,7 @@
 const fs = require('fs');
 const { execSync } = require('child_process');
 
-const ALLOWED_TYPES = new Set(['run', 'http', 'delay', 'notify']);
+const ALLOWED_TYPES = new Set(['run', 'http', 'delay', 'notify', 'webhook_trigger', 'cron_trigger', 'telegram_event_trigger']);
 const MAX_NODES = 50;
 const DEFAULT_RUN_TIMEOUT_MS = 60_000;
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
@@ -75,9 +75,54 @@ async function withTimeout(promise, ms, label) {
   }
 }
 
-async function runNode(node, index) {
+function getNestedValue(obj, pathStr) {
+  const parts = pathStr.split('.');
+  let current = obj;
+  for (const part of parts) {
+    if (current === null || current === undefined) return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function interpolate(value, nodeResults) {
+  if (typeof value === 'string') {
+    const singleMatch = value.match(/^\{\{\s*nodes\.([a-zA-Z0-9_-]+)\.outputs\.([a-zA-Z0-9_\.-]+)\s*\}\}$/);
+    if (singleMatch) {
+      const nodeId = singleMatch[1];
+      const path = singleMatch[2];
+      const nodeRes = nodeResults[nodeId];
+      if (nodeRes && nodeRes.outputs) {
+        const val = getNestedValue(nodeRes.outputs, path);
+        if (val !== undefined) return val;
+      }
+      return undefined;
+    }
+
+    return value.replace(/\{\{\s*nodes\.([a-zA-Z0-9_-]+)\.outputs\.([a-zA-Z0-9_\.-]+)\s*\}\}/g, (match, nodeId, path) => {
+      const nodeRes = nodeResults[nodeId];
+      if (nodeRes && nodeRes.outputs) {
+        const val = getNestedValue(nodeRes.outputs, path);
+        if (val !== undefined) {
+          return typeof val === 'object' ? JSON.stringify(val) : String(val);
+        }
+      }
+      return match;
+    });
+  } else if (Array.isArray(value)) {
+    return value.map(item => interpolate(item, nodeResults));
+  } else if (value !== null && typeof value === 'object') {
+    const res = {};
+    for (const k of Object.keys(value)) {
+      res[k] = interpolate(value[k], nodeResults);
+    }
+    return res;
+  }
+  return value;
+}
+
+async function runNode(node, index, nodeResults) {
   const entry = { id: node.id, index, type: node.type, started_at: new Date().toISOString() };
-  const step = node.config || {};
 
   if (!ALLOWED_TYPES.has(node.type)) {
     entry.status = 'failed';
@@ -85,6 +130,16 @@ async function runNode(node, index) {
     entry.finished_at = new Date().toISOString();
     throw Object.assign(new Error(entry.error), { entry });
   }
+
+  // Interpolate inputs and config using outputs from previously executed nodes
+  const resolvedInputs = node.inputs ? interpolate(node.inputs, nodeResults) : {};
+  const resolvedConfig = interpolate(node.config || {}, nodeResults);
+
+  entry.inputs = node.inputs || {};
+  entry.resolved_inputs = resolvedInputs;
+  entry.resolved_config = resolvedConfig;
+
+  const step = resolvedConfig;
 
   try {
     if (node.type === 'run') {
@@ -95,6 +150,7 @@ async function runNode(node, index) {
         timeout: timeoutMs,
       });
       entry.output = truncate(output);
+      entry.outputs = { output: truncate(output).trim() };
       entry.status = 'success';
     } else if (node.type === 'http') {
       const timeoutMs = step.timeout_ms || DEFAULT_HTTP_TIMEOUT_MS;
@@ -105,7 +161,7 @@ async function runNode(node, index) {
         res = await fetch(step.url, {
           method: step.method || 'GET',
           headers: step.headers || {},
-          body: step.body ? JSON.stringify(step.body) : undefined,
+          body: step.body ? (typeof step.body === 'string' ? step.body : JSON.stringify(step.body)) : undefined,
           signal: controller.signal,
         });
       } finally {
@@ -114,14 +170,30 @@ async function runNode(node, index) {
       const text = await res.text();
       entry.http_status = res.status;
       entry.response = truncate(text);
+
+      let parsedResponse;
+      try {
+        parsedResponse = JSON.parse(text);
+      } catch (e) {
+        parsedResponse = text;
+      }
+      entry.outputs = {
+        response: parsedResponse,
+        status: res.status
+      };
+
       entry.status = res.ok ? 'success' : 'failed';
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
     } else if (node.type === 'delay') {
       const ms = Math.min(step.ms || 0, 5 * 60_000); // cap at 5 minutes
       await withTimeout(new Promise((r) => setTimeout(r, ms)), ms + 1000, 'delay');
+      entry.outputs = { ms };
       entry.status = 'success';
     } else if (node.type === 'notify') {
       await sendTelegramMessage(step.message);
+      entry.outputs = { message: step.message };
+      entry.status = 'success';
+    } else if (node.type === 'webhook_trigger' || node.type === 'cron_trigger' || node.type === 'telegram_event_trigger') {
       entry.status = 'success';
     }
   } catch (err) {
@@ -186,7 +258,7 @@ async function runNode(node, index) {
 
     let entry;
     try {
-      entry = await runNode(node, index++);
+      entry = await runNode(node, index++, nodeResults);
       log.steps.push(entry);
       nodeResults[currentId] = entry;
       executed.add(currentId);

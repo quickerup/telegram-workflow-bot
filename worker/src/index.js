@@ -1,4 +1,4 @@
-const ALLOWED_STEP_TYPES = new Set(['run', 'http', 'delay', 'notify']);
+const ALLOWED_STEP_TYPES = new Set(['run', 'http', 'delay', 'notify', 'webhook_trigger', 'cron_trigger', 'telegram_event_trigger']);
 const MAX_NODES = 50;
 const MAX_FILE_SIZE_BYTES = 200_000; // 200 KB — plenty for a workflow definition
 const CONFIRM_TTL_SECONDS = 300; // pending workflows expire after 5 minutes
@@ -7,6 +7,110 @@ const DEDUPE_TTL_SECONDS = 3600; // remember update_ids for an hour
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // POST /webhooks/:id
+    if (request.method === 'POST' && url.pathname.startsWith('/webhooks/')) {
+      const parts = url.pathname.split('/');
+      if (parts.length === 3) {
+        const id = parts[2];
+        try {
+          if (!env.DB) {
+            throw new Error('Database is not configured');
+          }
+
+          const workflowRow = await env.DB.prepare(
+            `SELECT id, name FROM workflows WHERE id = ?`
+          ).bind(id).first();
+
+          if (!workflowRow) {
+            return new Response(JSON.stringify({ ok: false, error: 'Workflow not found' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const { results: nodesRows } = await env.DB.prepare(
+            `SELECT id, type, position_x, position_y, config FROM nodes WHERE workflow_id = ?`
+          ).bind(id).all();
+
+          // Check if there is a webhook_trigger node
+          const hasWebhookTrigger = nodesRows.some(row => row.type === 'webhook_trigger');
+          if (!hasWebhookTrigger) {
+            return new Response(JSON.stringify({ ok: false, error: 'Workflow does not have a webhook trigger' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const { results: edgesRows } = await env.DB.prepare(
+            `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
+          ).bind(id).all();
+
+          const nodes = nodesRows.map(row => ({
+            id: row.id,
+            type: row.type,
+            position: { x: row.position_x, y: row.position_y },
+            config: JSON.parse(row.config)
+          }));
+
+          const edges = edgesRows.map(row => ({
+            source: row.source,
+            target: row.target,
+            sourceHandle: row.source_handle || 'success'
+          }));
+
+          const workflowObj = {
+            id: workflowRow.id,
+            name: workflowRow.name,
+            nodes,
+            edges
+          };
+
+          const executionId = crypto.randomUUID();
+
+          await env.DB.prepare(
+            `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+          ).bind(
+            executionId,
+            id,
+            new Date().toISOString()
+          ).run();
+
+          // Get chat ID from optional body or default to ALLOWED_CHAT_IDS
+          let chatId = null;
+          let triggerPayload = null;
+          try {
+            triggerPayload = await request.json().catch(() => null);
+            if (triggerPayload && triggerPayload.chat_id) {
+              chatId = triggerPayload.chat_id;
+            }
+          } catch (e) {}
+
+          if (!chatId) {
+            const allowList = (env.ALLOWED_CHAT_IDS || '')
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean);
+            if (allowList.length > 0) {
+              chatId = allowList[0];
+            }
+          }
+
+          const workerUrl = `${url.protocol}//${url.host}`;
+          await dispatchWorkflow(env, workflowObj, chatId, executionId, workerUrl, triggerPayload);
+
+          return new Response(JSON.stringify({ ok: true, execution_id: executionId }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ ok: false, error: err.message }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+    }
 
     // Support execution feedback API: POST /executions/:id
     if (request.method === 'POST' && url.pathname.startsWith('/executions/')) {
@@ -124,19 +228,28 @@ export default {
           }
 
           const { results: nodesRows } = await env.DB.prepare(
-            `SELECT id, type, position_x, position_y, config FROM nodes WHERE workflow_id = ?`
+            `SELECT id, type, position_x, position_y, config, inputs, outputs FROM nodes WHERE workflow_id = ?`
           ).bind(id).all();
 
           const { results: edgesRows } = await env.DB.prepare(
             `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
           ).bind(id).all();
 
-          const nodes = nodesRows.map(row => ({
-            id: row.id,
-            type: row.type,
-            position: { x: row.position_x, y: row.position_y },
-            config: JSON.parse(row.config)
-          }));
+          const nodes = nodesRows.map(row => {
+            const nodeObj = {
+              id: row.id,
+              type: row.type,
+              position: { x: row.position_x, y: row.position_y },
+              config: JSON.parse(row.config)
+            };
+            if (row.inputs !== null && row.inputs !== undefined) {
+              nodeObj.inputs = JSON.parse(row.inputs);
+            }
+            if (row.outputs !== null && row.outputs !== undefined) {
+              nodeObj.outputs = JSON.parse(row.outputs);
+            }
+            return nodeObj;
+          });
 
           const edges = edgesRows.map(row => ({
             source: row.source,
@@ -206,10 +319,12 @@ export default {
         for (const node of workflow.nodes) {
           const posX = (node.position && typeof node.position.x === 'number') ? node.position.x : 0;
           const posY = (node.position && typeof node.position.y === 'number') ? node.position.y : 0;
+          const inputsStr = node.inputs ? JSON.stringify(node.inputs) : null;
+          const outputsStr = node.outputs ? JSON.stringify(node.outputs) : null;
           statements.push(
             env.DB.prepare(
-              `INSERT INTO nodes (id, workflow_id, type, position_x, position_y, config) VALUES (?, ?, ?, ?, ?, ?)`
-            ).bind(node.id, workflowId, node.type, posX, posY, JSON.stringify(node.config || {}))
+              `INSERT INTO nodes (id, workflow_id, type, position_x, position_y, config, inputs, outputs) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            ).bind(node.id, workflowId, node.type, posX, posY, JSON.stringify(node.config || {}), inputsStr, outputsStr)
           );
         }
 
@@ -229,12 +344,17 @@ export default {
           workflow: {
             id: workflowId,
             name: workflow.name,
-            nodes: workflow.nodes.map(n => ({
-              id: n.id,
-              type: n.type,
-              position: n.position || { x: 0, y: 0 },
-              config: n.config || {}
-            })),
+            nodes: workflow.nodes.map(n => {
+              const resNode = {
+                id: n.id,
+                type: n.type,
+                position: n.position || { x: 0, y: 0 },
+                config: n.config || {}
+              };
+              if (n.inputs) resNode.inputs = n.inputs;
+              if (n.outputs) resNode.outputs = n.outputs;
+              return resNode;
+            }),
             edges: edges.map(e => ({
               source: e.source,
               target: e.target,
@@ -275,19 +395,28 @@ export default {
           }
 
           const { results: nodesRows } = await env.DB.prepare(
-            `SELECT id, type, position_x, position_y, config FROM nodes WHERE workflow_id = ?`
+            `SELECT id, type, position_x, position_y, config, inputs, outputs FROM nodes WHERE workflow_id = ?`
           ).bind(id).all();
 
           const { results: edgesRows } = await env.DB.prepare(
             `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
           ).bind(id).all();
 
-          const nodes = nodesRows.map(row => ({
-            id: row.id,
-            type: row.type,
-            position: { x: row.position_x, y: row.position_y },
-            config: JSON.parse(row.config)
-          }));
+          const nodes = nodesRows.map(row => {
+            const nodeObj = {
+              id: row.id,
+              type: row.type,
+              position: { x: row.position_x, y: row.position_y },
+              config: JSON.parse(row.config)
+            };
+            if (row.inputs !== null && row.inputs !== undefined) {
+              nodeObj.inputs = JSON.parse(row.inputs);
+            }
+            if (row.outputs !== null && row.outputs !== undefined) {
+              nodeObj.outputs = JSON.parse(row.outputs);
+            }
+            return nodeObj;
+          });
 
           const edges = edgesRows.map(row => ({
             source: row.source,
@@ -369,7 +498,7 @@ export default {
           }
 
           const nodeRow = await env.DB.prepare(
-            `SELECT id, type, position_x, position_y, config FROM nodes WHERE workflow_id = ? AND id = ?`
+            `SELECT id, type, position_x, position_y, config, inputs, outputs FROM nodes WHERE workflow_id = ? AND id = ?`
           ).bind(id, nodeId).first();
 
           if (!nodeRow) {
@@ -385,6 +514,12 @@ export default {
             position: { x: nodeRow.position_x, y: nodeRow.position_y },
             config: JSON.parse(nodeRow.config)
           };
+          if (nodeRow.inputs !== null && nodeRow.inputs !== undefined) {
+            node.inputs = JSON.parse(nodeRow.inputs);
+          }
+          if (nodeRow.outputs !== null && nodeRow.outputs !== undefined) {
+            node.outputs = JSON.parse(nodeRow.outputs);
+          }
 
           // Get chat ID from optional body or default to ALLOWED_CHAT_IDS
           let chatId = null;
@@ -489,8 +624,101 @@ export default {
       await env.WORKFLOW_STATE.put(dedupeKey, '1', { expirationTtl: DEDUPE_TTL_SECONDS });
     }
 
-    const callbackQuery = update.callback_query;
-    const message = update.message || (callbackQuery ? callbackQuery.message : null);
+    // --- Telegram Event Triggers ---
+    if (env.DB) {
+      try {
+        const { results: workflows } = await env.DB.prepare(
+          `SELECT id, name FROM workflows`
+        ).all();
+
+        for (const wf of workflows) {
+          const { results: nodesRows } = await env.DB.prepare(
+            `SELECT id, type, config FROM nodes WHERE workflow_id = ?`
+          ).bind(wf.id).all();
+
+          const eventTriggers = nodesRows.filter(row => row.type === 'telegram_event_trigger');
+          if (eventTriggers.length === 0) continue;
+
+          let shouldTrigger = false;
+          for (const trigger of eventTriggers) {
+            const config = JSON.parse(trigger.config);
+            if (config && config.event_type) {
+              const eventTypes = Array.isArray(config.event_type) ? config.event_type : [config.event_type];
+              if (eventTypes.some(et => matchTelegramEvent(update, et))) {
+                shouldTrigger = true;
+                break;
+              }
+            }
+          }
+
+          if (shouldTrigger) {
+            const { results: edgesRows } = await env.DB.prepare(
+              `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
+            ).bind(wf.id).all();
+
+            const nodes = nodesRows.map(row => ({
+              id: row.id,
+              type: row.type,
+              position: { x: 0, y: 0 },
+              config: JSON.parse(row.config)
+            }));
+
+            const edges = edgesRows.map(row => ({
+              source: row.source,
+              target: row.target,
+              sourceHandle: row.source_handle || 'success'
+            }));
+
+            const workflowObj = {
+              id: wf.id,
+              name: wf.name,
+              nodes,
+              edges
+            };
+
+            const executionId = crypto.randomUUID();
+
+            await env.DB.prepare(
+              `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+            ).bind(
+              executionId,
+              wf.id,
+              new Date().toISOString()
+            ).run();
+
+            let chatId = null;
+            if (update.message && update.message.chat) {
+              chatId = update.message.chat.id;
+            } else if (update.edited_message && update.edited_message.chat) {
+              chatId = update.edited_message.chat.id;
+            } else if (update.my_chat_member && update.my_chat_member.chat) {
+              chatId = update.my_chat_member.chat.id;
+            } else if (update.chat_member && update.chat_member.chat) {
+              chatId = update.chat_member.chat.id;
+            } else if (update.chat_join_request && update.chat_join_request.chat) {
+              chatId = update.chat_join_request.chat.id;
+            }
+
+            if (!chatId) {
+              const allowList = (env.ALLOWED_CHAT_IDS || '')
+                .split(',')
+                .map((s) => s.trim())
+                .filter(Boolean);
+              if (allowList.length > 0) {
+                chatId = allowList[0];
+              }
+            }
+
+            const workerUrl = `${url.protocol}//${url.host}`;
+            await dispatchWorkflow(env, workflowObj, chatId, executionId, workerUrl, { telegram_update: update });
+          }
+        }
+      } catch (err) {
+        console.error('Error matching telegram_event_trigger:', err);
+      }
+    }
+
+    const message = update.message;
     if (!message) return new Response('OK');
 
     const chatId = message.chat.id;
@@ -544,6 +772,90 @@ export default {
 
     return new Response('OK');
   },
+
+  async scheduled(event, env, ctx) {
+    if (!env.DB) {
+      console.error('Database is not configured');
+      return;
+    }
+
+    try {
+      const date = new Date(event.scheduledTime || Date.now());
+
+      const { results: workflows } = await env.DB.prepare(
+        `SELECT id, name FROM workflows`
+      ).all();
+
+      for (const wf of workflows) {
+        const { results: nodesRows } = await env.DB.prepare(
+          `SELECT id, type, config FROM nodes WHERE workflow_id = ?`
+        ).bind(wf.id).all();
+
+        // Check if there are cron_trigger nodes
+        const cronTriggers = nodesRows.filter(row => row.type === 'cron_trigger');
+        if (cronTriggers.length === 0) continue;
+
+        let shouldTrigger = false;
+        for (const trigger of cronTriggers) {
+          const config = JSON.parse(trigger.config);
+          if (config && config.cron && matchCron(config.cron, date)) {
+            shouldTrigger = true;
+            break;
+          }
+        }
+
+        if (shouldTrigger) {
+          const { results: edgesRows } = await env.DB.prepare(
+            `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
+          ).bind(wf.id).all();
+
+          const nodes = nodesRows.map(row => ({
+            id: row.id,
+            type: row.type,
+            position: { x: 0, y: 0 },
+            config: JSON.parse(row.config)
+          }));
+
+          const edges = edgesRows.map(row => ({
+            source: row.source,
+            target: row.target,
+            sourceHandle: row.source_handle || 'success'
+          }));
+
+          const workflowObj = {
+            id: wf.id,
+            name: wf.name,
+            nodes,
+            edges
+          };
+
+          const executionId = crypto.randomUUID();
+
+          await env.DB.prepare(
+            `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+          ).bind(
+            executionId,
+            wf.id,
+            new Date().toISOString()
+          ).run();
+
+          let chatId = null;
+          const allowList = (env.ALLOWED_CHAT_IDS || '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
+          if (allowList.length > 0) {
+            chatId = allowList[0];
+          }
+
+          const workerUrl = env.WORKER_URL || 'http://localhost:8787';
+          await dispatchWorkflow(env, workflowObj, chatId, executionId, workerUrl, { scheduled_time: date.toISOString() });
+        }
+      }
+    } catch (err) {
+      console.error('Error during scheduled execution:', err);
+    }
+  },
 };
 
 function validateWorkflow(workflow) {
@@ -591,6 +903,14 @@ function validateWorkflow(workflow) {
       }
     }
 
+    if (node.inputs !== undefined && (typeof node.inputs !== 'object' || node.inputs === null)) {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "inputs" must be an object`);
+    }
+
+    if (node.outputs !== undefined && (typeof node.outputs !== 'object' || node.outputs === null)) {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "outputs" must be an object`);
+    }
+
     if (!node.config || typeof node.config !== 'object') {
       errors.push(`node ${i} (${node.id || 'unnamed'}): missing or invalid "config" object`);
       return;
@@ -608,6 +928,14 @@ function validateWorkflow(workflow) {
     }
     if (node.type === 'notify' && typeof config.message !== 'string') {
       errors.push(`node ${i} (${node.id || 'unnamed'}): "notify" config needs a string "message"`);
+    }
+    if (node.type === 'cron_trigger' && typeof config.cron !== 'string') {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "cron_trigger" config needs a string "cron"`);
+    }
+    if (node.type === 'telegram_event_trigger') {
+      if (typeof config.event_type !== 'string' && !Array.isArray(config.event_type)) {
+        errors.push(`node ${i} (${node.id || 'unnamed'}): "telegram_event_trigger" config needs a string or array "event_type"`);
+      }
     }
   });
 
@@ -784,15 +1112,19 @@ async function handleConfirm(env, chatId, text, requestUrl) {
 
     // Insert new nodes
     const nodeStmts = workflow.nodes.map(node => {
+      const inputsStr = node.inputs ? JSON.stringify(node.inputs) : null;
+      const outputsStr = node.outputs ? JSON.stringify(node.outputs) : null;
       return env.DB.prepare(
-        `INSERT INTO nodes (id, workflow_id, type, position_x, position_y, config) VALUES (?, ?, ?, ?, ?, ?)`
+        `INSERT INTO nodes (id, workflow_id, type, position_x, position_y, config, inputs, outputs) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
       ).bind(
         node.id,
         workflowId,
         node.type,
         node.position.x,
         node.position.y,
-        JSON.stringify(node.config)
+        JSON.stringify(node.config),
+        inputsStr,
+        outputsStr
       );
     });
 
@@ -843,294 +1175,7 @@ async function handleCancel(env, chatId) {
   await sendMessage(env, chatId, 'Discarded.');
 }
 
-async function getBuilderState(env, chatId) {
-  const data = await env.WORKFLOW_STATE.get(`builder:${chatId}`);
-  return data ? JSON.parse(data) : null;
-}
-
-async function setBuilderState(env, chatId, state) {
-  await env.WORKFLOW_STATE.put(`builder:${chatId}`, JSON.stringify(state));
-}
-
-async function clearBuilderState(env, chatId) {
-  await env.WORKFLOW_STATE.delete(`builder:${chatId}`);
-}
-
-async function handleNewWorkflow(env, chatId, text) {
-  const parts = text.trim().split(/\s+/);
-  let name = parts.slice(1).join(' ').trim();
-
-  if (name) {
-    const state = {
-      state: 'AWAITING_NODE_TYPE',
-      workflow: {
-        name,
-        nodes: [],
-        edges: []
-      }
-    };
-    await setBuilderState(env, chatId, state);
-    await promptNodeType(env, chatId, state);
-  } else {
-    const state = {
-      state: 'AWAITING_NAME',
-      workflow: {
-        name: '',
-        nodes: [],
-        edges: []
-      }
-    };
-    await setBuilderState(env, chatId, state);
-    await sendMessage(env, chatId, "Let's build a new workflow! What should we name it?\n(Or send /cancel to abort)");
-  }
-}
-
-async function promptNodeType(env, chatId, state) {
-  const inlineKeyboard = {
-    inline_keyboard: [
-      [
-        { text: 'Run Command (run)', callback_data: 'type:run' },
-        { text: 'HTTP Request (http)', callback_data: 'type:http' }
-      ],
-      [
-        { text: 'Delay (delay)', callback_data: 'type:delay' },
-        { text: 'Telegram Notify (notify)', callback_data: 'type:notify' }
-      ],
-      [
-        { text: '❌ Cancel Builder', callback_data: 'builder:cancel' }
-      ]
-    ]
-  };
-  await sendMessage(env, chatId, `Select the type for node #${state.workflow.nodes.length + 1}:`, inlineKeyboard);
-}
-
-async function handleBuilderCallback(env, chatId, callbackQuery) {
-  const data = callbackQuery.data;
-  let state = await getBuilderState(env, chatId);
-  if (!state) {
-    await sendMessage(env, chatId, "No active workflow builder session. Send /newworkflow to start.");
-    return;
-  }
-
-  if (data === 'builder:cancel') {
-    await clearBuilderState(env, chatId);
-    await sendMessage(env, chatId, "Workflow builder canceled.");
-    return;
-  }
-
-  // Reject action buttons if they are clicked out-of-order/stale while in the middle of configuring a node
-  if ((data === 'builder:add_node' || data === 'builder:finish') && state.state !== 'AWAITING_NEXT_ACTION') {
-    await sendMessage(env, chatId, "⚠️ Please finish configuring the current node first or cancel the builder with /cancel.");
-    return;
-  }
-
-  if (data === 'builder:add_node') {
-    state.state = 'AWAITING_NODE_TYPE';
-    await setBuilderState(env, chatId, state);
-    await promptNodeType(env, chatId, state);
-    return;
-  }
-
-  if (data === 'builder:finish') {
-    await finalizeAndStageWorkflow(env, chatId, state);
-    return;
-  }
-
-  if (state.state === 'AWAITING_NODE_TYPE' && data.startsWith('type:')) {
-    const nodeType = data.substring(5);
-    state.currentNode = {
-      id: `node_${state.workflow.nodes.length + 1}`,
-      type: nodeType,
-      config: {}
-    };
-
-    if (nodeType === 'run') {
-      state.state = 'AWAITING_RUN_COMMAND';
-      await setBuilderState(env, chatId, state);
-      await sendMessage(env, chatId, `Node [${state.currentNode.id}]: Enter the shell command to execute:`);
-    } else if (nodeType === 'http') {
-      state.state = 'AWAITING_HTTP_URL';
-      await setBuilderState(env, chatId, state);
-      await sendMessage(env, chatId, `Node [${state.currentNode.id}]: Enter the target HTTP URL:`);
-    } else if (nodeType === 'delay') {
-      state.state = 'AWAITING_DELAY_MS';
-      await setBuilderState(env, chatId, state);
-      await sendMessage(env, chatId, `Node [${state.currentNode.id}]: Enter the delay in milliseconds (e.g. 5000):`);
-    } else if (nodeType === 'notify') {
-      state.state = 'AWAITING_NOTIFY_MESSAGE';
-      await setBuilderState(env, chatId, state);
-      await sendMessage(env, chatId, `Node [${state.currentNode.id}]: Enter the message to notify/send to Telegram:`);
-    }
-    return;
-  }
-
-  if (state.state === 'AWAITING_HTTP_METHOD' && data.startsWith('method:')) {
-    const method = data.substring(7);
-    state.currentNode.config.method = method;
-    await commitCurrentNode(env, chatId, state);
-  }
-}
-
-async function handleBuilderState(env, chatId, text) {
-  const state = await getBuilderState(env, chatId);
-  if (!state) return false;
-
-  if (typeof text !== 'string' || !text) {
-    await sendMessage(env, chatId, "⚠️ Unexpected message type. Please enter text configuration or /cancel.");
-    return true; // We handled/consumed it so it doesn't trigger the default help text
-  }
-
-  if (state.state === 'AWAITING_NAME') {
-    const name = text.trim();
-    if (!name) {
-      await sendMessage(env, chatId, "Name cannot be empty. Please enter a workflow name:");
-      return true;
-    }
-    state.workflow.name = name;
-    state.state = 'AWAITING_NODE_TYPE';
-    await setBuilderState(env, chatId, state);
-    await promptNodeType(env, chatId, state);
-    return true;
-  }
-
-  if (state.state === 'AWAITING_RUN_COMMAND') {
-    const command = text.trim();
-    if (!command) {
-      await sendMessage(env, chatId, "Command cannot be empty. Please enter a shell command:");
-      return true;
-    }
-    state.currentNode.config.command = command;
-    await commitCurrentNode(env, chatId, state);
-    return true;
-  }
-
-  if (state.state === 'AWAITING_HTTP_URL') {
-    const url = text.trim();
-    if (!url) {
-      await sendMessage(env, chatId, "URL cannot be empty. Please enter an HTTP URL:");
-      return true;
-    }
-    state.currentNode.config.url = url;
-    state.state = 'AWAITING_HTTP_METHOD';
-    await setBuilderState(env, chatId, state);
-
-    const inlineKeyboard = {
-      inline_keyboard: [
-        [
-          { text: 'GET', callback_data: 'method:GET' },
-          { text: 'POST', callback_data: 'method:POST' }
-        ],
-        [
-          { text: 'PUT', callback_data: 'method:PUT' },
-          { text: 'DELETE', callback_data: 'method:DELETE' }
-        ]
-      ]
-    };
-    await sendMessage(env, chatId, `Node [${state.currentNode.id}]: Select the HTTP Method:`, inlineKeyboard);
-    return true;
-  }
-
-  if (state.state === 'AWAITING_DELAY_MS') {
-    const ms = parseInt(text.trim(), 10);
-    if (isNaN(ms) || ms < 0) {
-      await sendMessage(env, chatId, "Please enter a valid non-negative number for milliseconds delay:");
-      return true;
-    }
-    state.currentNode.config.ms = ms;
-    await commitCurrentNode(env, chatId, state);
-    return true;
-  }
-
-  if (state.state === 'AWAITING_NOTIFY_MESSAGE') {
-    const message = text.trim();
-    if (!message) {
-      await sendMessage(env, chatId, "Message cannot be empty. Please enter a notification message:");
-      return true;
-    }
-    state.currentNode.config.message = message;
-    await commitCurrentNode(env, chatId, state);
-    return true;
-  }
-
-  return false;
-}
-
-async function commitCurrentNode(env, chatId, state) {
-  const node = state.currentNode;
-  node.position = {
-    x: 100,
-    y: 100 + state.workflow.nodes.length * 150
-  };
-
-  const previousNode = state.workflow.nodes[state.workflow.nodes.length - 1];
-  state.workflow.nodes.push(node);
-
-  if (previousNode) {
-    state.workflow.edges.push({
-      source: previousNode.id,
-      target: node.id,
-      sourceHandle: 'success'
-    });
-  }
-
-  delete state.currentNode;
-  state.state = 'AWAITING_NEXT_ACTION';
-  await setBuilderState(env, chatId, state);
-
-  let currentSummary = `Successfully added Node [${node.id}] (${node.type}).\n\nCurrent Workflow structure:\n`;
-  state.workflow.nodes.forEach((n) => {
-    currentSummary += `- [${n.id}] ${n.type}\n`;
-  });
-
-  const inlineKeyboard = {
-    inline_keyboard: [
-      [
-        { text: '➕ Add Next Node', callback_data: 'builder:add_node' },
-        { text: '💾 Save & Finish', callback_data: 'builder:finish' }
-      ],
-      [
-        { text: '❌ Cancel Builder', callback_data: 'builder:cancel' }
-      ]
-    ]
-  };
-
-  await sendMessage(env, chatId, currentSummary + `\nWhat would you like to do next?`, inlineKeyboard);
-}
-
-async function finalizeAndStageWorkflow(env, chatId, state) {
-  const workflow = state.workflow;
-  if (!workflow.nodes || workflow.nodes.length === 0) {
-    await sendMessage(env, chatId, "Cannot finalize workflow with no nodes. Add at least one node or /cancel.");
-    return;
-  }
-
-  const errors = validateWorkflow(workflow);
-  if (errors.length > 0) {
-    await sendMessage(env, chatId, `Workflow validation failed:\n- ${errors.join('\n- ')}\n\nCancel builder with /cancel.`);
-    return;
-  }
-
-  // Stage workflow and require explicit /confirm
-  const token = crypto.randomUUID().slice(0, 8);
-  const pendingKey = `pending:${chatId}`;
-  await env.WORKFLOW_STATE.put(
-    pendingKey,
-    JSON.stringify({ workflow, token, created_at: Date.now() }),
-    { expirationTtl: CONFIRM_TTL_SECONDS }
-  );
-
-  const summary = summarizeWorkflow(workflow);
-  await sendMessage(
-    env, chatId,
-    `Workflow builder finished! Staged "${workflow.name}" (${workflow.nodes.length} node(s)):\n\n${summary}\n\n` +
-    `Reply "/confirm ${token}" within ${CONFIRM_TTL_SECONDS / 60} minutes to run it, or /cancel to discard.`
-  );
-
-  // Clear builder state only after the staging and confirmation message is successful
-  await clearBuilderState(env, chatId);
-}
-
-async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl) {
+async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl, triggerPayload = null) {
   const res = await fetch(
     `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/dispatches`,
     {
@@ -1147,7 +1192,8 @@ async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl) {
           payload: workflow,
           chat_id: chatId,
           execution_id: executionId,
-          worker_url: workerUrl
+          worker_url: workerUrl,
+          trigger_payload: triggerPayload
         },
       }),
     }
@@ -1250,4 +1296,115 @@ async function executeSimpleNodeInWorker(env, node, chatId) {
   }
   entry.finished_at = new Date().toISOString();
   return entry;
+}
+
+function matchCron(cron, date) {
+  const fields = cron.trim().split(/\s+/);
+  if (fields.length !== 5) return false;
+
+  const mins = date.getUTCMinutes();
+  const hours = date.getUTCHours();
+  const dayOfMonth = date.getUTCDate();
+  const month = date.getUTCMonth() + 1; // getUTCMonth is 0-indexed (0 = January)
+  const dayOfWeek = date.getUTCDay(); // 0 = Sunday
+
+  const matchField = (field, value, minVal, maxVal) => {
+    if (field === '*') return true;
+
+    // Normalize dayOfWeek: 7 becomes 0
+    if (maxVal === 6 && field === '7') {
+      field = '0';
+    }
+
+    // Handle comma-separated values
+    const parts = field.split(',');
+    if (parts.length > 1) {
+      return parts.some(p => matchField(p, value, minVal, maxVal));
+    }
+
+    // Handle step values, e.g., */5 or 1-10/2
+    if (field.includes('/')) {
+      const [range, stepStr] = field.split('/');
+      const step = parseInt(stepStr, 10);
+      if (isNaN(step)) return false;
+
+      let start = minVal;
+      let end = maxVal;
+      if (range !== '*') {
+        if (range.includes('-')) {
+          const [startStr, endStr] = range.split('-');
+          start = parseInt(startStr, 10);
+          end = parseInt(endStr, 10);
+        } else {
+          start = parseInt(range, 10);
+        }
+      }
+      if (isNaN(start) || isNaN(end)) return false;
+      if (value < start || value > end) return false;
+      return (value - start) % step === 0;
+    }
+
+    // Handle ranges, e.g., 1-5
+    if (field.includes('-')) {
+      const [startStr, endStr] = field.split('-');
+      const start = parseInt(startStr, 10);
+      const end = parseInt(endStr, 10);
+      if (isNaN(start) || isNaN(end)) return false;
+      return value >= start && value <= end;
+    }
+
+    // Handle single number
+    const num = parseInt(field, 10);
+    return num === value;
+  };
+
+  return (
+    matchField(fields[0], mins, 0, 59) &&
+    matchField(fields[1], hours, 0, 23) &&
+    matchField(fields[2], dayOfMonth, 1, 31) &&
+    matchField(fields[3], month, 1, 12) &&
+    matchField(fields[4], dayOfWeek, 0, 6)
+  );
+}
+
+function matchTelegramEvent(update, eventType) {
+  if (!update) return false;
+
+  const type = eventType.toLowerCase();
+
+  if (type === 'edited_message') {
+    return !!update.edited_message;
+  }
+  if (type === 'new_chat_members') {
+    return !!(update.message && update.message.new_chat_members);
+  }
+  if (type === 'left_chat_member') {
+    return !!(update.message && update.message.left_chat_member);
+  }
+  if (type === 'callback_query') {
+    return !!update.callback_query;
+  }
+  if (type === 'inline_query') {
+    return !!update.inline_query;
+  }
+  if (type === 'poll') {
+    return !!update.poll;
+  }
+  if (type === 'poll_answer') {
+    return !!update.poll_answer;
+  }
+  if (type === 'chat_member') {
+    return !!update.chat_member;
+  }
+  if (type === 'my_chat_member') {
+    return !!update.my_chat_member;
+  }
+  if (type === 'chat_join_request') {
+    return !!update.chat_join_request;
+  }
+  if (type === 'message') {
+    return !!update.message;
+  }
+
+  return false;
 }

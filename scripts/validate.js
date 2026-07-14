@@ -4,7 +4,7 @@
 
 const fs = require('fs');
 
-const ALLOWED_TYPES = new Set(['run', 'http', 'delay', 'notify']);
+const ALLOWED_TYPES = new Set(['run', 'http', 'delay', 'notify', 'webhook_trigger', 'cron_trigger', 'telegram_event_trigger']);
 const MAX_NODES = 50;
 
 const file = process.argv[2];
@@ -61,6 +61,14 @@ if (!Array.isArray(workflow.nodes)) {
       }
     }
 
+    if (node.inputs !== undefined && (typeof node.inputs !== 'object' || node.inputs === null)) {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "inputs" must be an object`);
+    }
+
+    if (node.outputs !== undefined && (typeof node.outputs !== 'object' || node.outputs === null)) {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "outputs" must be an object`);
+    }
+
     if (!node.config || typeof node.config !== 'object') {
       errors.push(`node ${i} (${node.id || 'unnamed'}): missing or invalid "config" object`);
       return;
@@ -78,6 +86,14 @@ if (!Array.isArray(workflow.nodes)) {
     }
     if (node.type === 'notify' && typeof config.message !== 'string') {
       errors.push(`node ${i} (${node.id || 'unnamed'}): "notify" config needs a string "message"`);
+    }
+    if (node.type === 'cron_trigger' && typeof config.cron !== 'string') {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "cron_trigger" config needs a string "cron"`);
+    }
+    if (node.type === 'telegram_event_trigger') {
+      if (typeof config.event_type !== 'string' && !Array.isArray(config.event_type)) {
+        errors.push(`node ${i} (${node.id || 'unnamed'}): "telegram_event_trigger" config needs a string or array "event_type"`);
+      }
     }
   });
 
