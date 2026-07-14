@@ -61,6 +61,14 @@ if (!Array.isArray(workflow.nodes)) {
       }
     }
 
+    if (node.inputs !== undefined && (typeof node.inputs !== 'object' || node.inputs === null)) {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "inputs" must be an object`);
+    }
+
+    if (node.outputs !== undefined && (typeof node.outputs !== 'object' || node.outputs === null)) {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "outputs" must be an object`);
+    }
+
     if (!node.config || typeof node.config !== 'object') {
       errors.push(`node ${i} (${node.id || 'unnamed'}): missing or invalid "config" object`);
       return;

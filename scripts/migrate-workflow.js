@@ -50,7 +50,9 @@ oldData.steps.forEach((step, idx) => {
     id,
     type,
     position,
-    config: restConfig
+    config: restConfig,
+    inputs: {},
+    outputs: {}
   });
 
   if (idx > 0) {

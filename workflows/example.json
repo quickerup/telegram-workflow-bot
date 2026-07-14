@@ -43,8 +43,12 @@
         "x": 100,
         "y": 550
       },
+      "inputs": {
+        "zen_phrase": "{{ nodes.node_2.outputs.response }}",
+        "timestamp": "{{ nodes.node_1.outputs.output }}"
+      },
       "config": {
-        "message": "hello-world workflow reached its final step"
+        "message": "hello-world workflow reached its final step!\n\nZen quote: {{ nodes.node_2.outputs.response }}\nLast run output:\n{{ nodes.node_1.outputs.output }}"
       }
     }
   ],
