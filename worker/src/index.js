@@ -43,6 +43,399 @@ export default {
       }
     }
 
+    // --- Cloudflare Access Protection for Editor routes ---
+    if (url.pathname.startsWith('/api/')) {
+      const isDevBypass = env.DEV_BYPASS_ACCESS === 'true';
+      if (!isDevBypass) {
+        const jwtAssertion = request.headers.get('Cf-Access-Jwt-Assertion');
+        const userEmail = request.headers.get('Cf-Access-Authenticated-User-Email');
+        if (!jwtAssertion && !userEmail) {
+          return new Response(JSON.stringify({ ok: false, error: 'Unauthorized: Cloudflare Access authentication required.' }), {
+            status: 401,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+    }
+
+    // GET /api/workflows
+    if (url.pathname === '/api/workflows' && request.method === 'GET') {
+      try {
+        if (!env.DB) {
+          throw new Error('Database is not configured');
+        }
+        const { results } = await env.DB.prepare(
+          `SELECT id, name, created_at FROM workflows ORDER BY created_at DESC`
+        ).all();
+        return new Response(JSON.stringify(results), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: err.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // GET /api/workflows/:id
+    if (url.pathname.startsWith('/api/workflows/') && request.method === 'GET') {
+      const parts = url.pathname.split('/');
+      if (parts.length === 4) {
+        const id = parts[3];
+        try {
+          if (!env.DB) {
+            throw new Error('Database is not configured');
+          }
+          const workflowRow = await env.DB.prepare(
+            `SELECT id, name, created_at FROM workflows WHERE id = ?`
+          ).bind(id).first();
+
+          if (!workflowRow) {
+            return new Response(JSON.stringify({ ok: false, error: 'Workflow not found' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const { results: nodesRows } = await env.DB.prepare(
+            `SELECT id, type, position_x, position_y, config FROM nodes WHERE workflow_id = ?`
+          ).bind(id).all();
+
+          const { results: edgesRows } = await env.DB.prepare(
+            `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
+          ).bind(id).all();
+
+          const nodes = nodesRows.map(row => ({
+            id: row.id,
+            type: row.type,
+            position: { x: row.position_x, y: row.position_y },
+            config: JSON.parse(row.config)
+          }));
+
+          const edges = edgesRows.map(row => ({
+            source: row.source,
+            target: row.target,
+            sourceHandle: row.source_handle || 'success'
+          }));
+
+          const workflowObj = {
+            id: workflowRow.id,
+            name: workflowRow.name,
+            created_at: workflowRow.created_at,
+            nodes,
+            edges
+          };
+
+          return new Response(JSON.stringify(workflowObj), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ ok: false, error: err.message }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+    }
+
+    // POST /api/workflows
+    if (url.pathname === '/api/workflows' && request.method === 'POST') {
+      try {
+        if (!env.DB) {
+          throw new Error('Database is not configured');
+        }
+        let workflow;
+        try {
+          workflow = await request.json();
+        } catch (e) {
+          return new Response(JSON.stringify({ ok: false, error: 'Invalid JSON body' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        const errors = validateWorkflow(workflow);
+        if (errors.length > 0) {
+          return new Response(JSON.stringify({ ok: false, errors }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        const workflowId = workflow.id || workflow.name.replace(/[^a-z0-9_-]/gi, '_');
+        if (!/^[a-z0-9_-]+$/i.test(workflowId)) {
+          return new Response(JSON.stringify({ ok: false, error: 'Invalid workflow ID generated/provided' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+
+        const statements = [
+          env.DB.prepare(`INSERT OR REPLACE INTO workflows (id, name) VALUES (?, ?)`).bind(workflowId, workflow.name),
+          env.DB.prepare(`DELETE FROM nodes WHERE workflow_id = ?`).bind(workflowId),
+          env.DB.prepare(`DELETE FROM edges WHERE workflow_id = ?`).bind(workflowId)
+        ];
+
+        for (const node of workflow.nodes) {
+          const posX = (node.position && typeof node.position.x === 'number') ? node.position.x : 0;
+          const posY = (node.position && typeof node.position.y === 'number') ? node.position.y : 0;
+          statements.push(
+            env.DB.prepare(
+              `INSERT INTO nodes (id, workflow_id, type, position_x, position_y, config) VALUES (?, ?, ?, ?, ?, ?)`
+            ).bind(node.id, workflowId, node.type, posX, posY, JSON.stringify(node.config || {}))
+          );
+        }
+
+        const edges = workflow.edges || [];
+        for (const edge of edges) {
+          statements.push(
+            env.DB.prepare(
+              `INSERT INTO edges (workflow_id, source, target, source_handle) VALUES (?, ?, ?, ?)`
+            ).bind(workflowId, edge.source, edge.target, edge.sourceHandle || 'success')
+          );
+        }
+
+        await env.DB.batch(statements);
+
+        return new Response(JSON.stringify({
+          ok: true,
+          workflow: {
+            id: workflowId,
+            name: workflow.name,
+            nodes: workflow.nodes.map(n => ({
+              id: n.id,
+              type: n.type,
+              position: n.position || { x: 0, y: 0 },
+              config: n.config || {}
+            })),
+            edges: edges.map(e => ({
+              source: e.source,
+              target: e.target,
+              sourceHandle: e.sourceHandle || 'success'
+            }))
+          }
+        }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: err.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
+    // POST /api/workflows/:id/execute
+    if (url.pathname.startsWith('/api/workflows/') && url.pathname.endsWith('/execute') && request.method === 'POST') {
+      const parts = url.pathname.split('/');
+      if (parts.length === 5) {
+        const id = parts[3];
+        try {
+          if (!env.DB) {
+            throw new Error('Database is not configured');
+          }
+
+          const workflowRow = await env.DB.prepare(
+            `SELECT id, name FROM workflows WHERE id = ?`
+          ).bind(id).first();
+
+          if (!workflowRow) {
+            return new Response(JSON.stringify({ ok: false, error: 'Workflow not found' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const { results: nodesRows } = await env.DB.prepare(
+            `SELECT id, type, position_x, position_y, config FROM nodes WHERE workflow_id = ?`
+          ).bind(id).all();
+
+          const { results: edgesRows } = await env.DB.prepare(
+            `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
+          ).bind(id).all();
+
+          const nodes = nodesRows.map(row => ({
+            id: row.id,
+            type: row.type,
+            position: { x: row.position_x, y: row.position_y },
+            config: JSON.parse(row.config)
+          }));
+
+          const edges = edgesRows.map(row => ({
+            source: row.source,
+            target: row.target,
+            sourceHandle: row.source_handle || 'success'
+          }));
+
+          const workflowObj = {
+            id: workflowRow.id,
+            name: workflowRow.name,
+            nodes,
+            edges
+          };
+
+          const executionId = crypto.randomUUID();
+
+          await env.DB.prepare(
+            `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+          ).bind(
+            executionId,
+            id,
+            new Date().toISOString()
+          ).run();
+
+          // Get chat ID from optional body or default to ALLOWED_CHAT_IDS
+          let chatId = null;
+          try {
+            const body = await request.json().catch(() => ({}));
+            chatId = body.chat_id || null;
+          } catch (e) {}
+
+          if (!chatId) {
+            const allowList = (env.ALLOWED_CHAT_IDS || '')
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean);
+            if (allowList.length > 0) {
+              chatId = allowList[0];
+            }
+          }
+
+          const workerUrl = `${url.protocol}//${url.host}`;
+          await dispatchWorkflow(env, workflowObj, chatId, executionId, workerUrl);
+
+          return new Response(JSON.stringify({ ok: true, execution_id: executionId }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ ok: false, error: err.message }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+    }
+
+    // POST /api/workflows/:id/nodes/:nodeId/execute
+    if (url.pathname.startsWith('/api/workflows/') && url.pathname.includes('/nodes/') && url.pathname.endsWith('/execute') && request.method === 'POST') {
+      const parts = url.pathname.split('/');
+      if (parts.length === 7 && parts[4] === 'nodes' && parts[6] === 'execute') {
+        const id = parts[3];
+        const nodeId = parts[5];
+
+        try {
+          if (!env.DB) {
+            throw new Error('Database is not configured');
+          }
+
+          const workflowRow = await env.DB.prepare(
+            `SELECT id, name FROM workflows WHERE id = ?`
+          ).bind(id).first();
+
+          if (!workflowRow) {
+            return new Response(JSON.stringify({ ok: false, error: 'Workflow not found' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const nodeRow = await env.DB.prepare(
+            `SELECT id, type, position_x, position_y, config FROM nodes WHERE workflow_id = ? AND id = ?`
+          ).bind(id, nodeId).first();
+
+          if (!nodeRow) {
+            return new Response(JSON.stringify({ ok: false, error: 'Node not found' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const node = {
+            id: nodeRow.id,
+            type: nodeRow.type,
+            position: { x: nodeRow.position_x, y: nodeRow.position_y },
+            config: JSON.parse(nodeRow.config)
+          };
+
+          // Get chat ID from optional body or default to ALLOWED_CHAT_IDS
+          let chatId = null;
+          try {
+            const body = await request.json().catch(() => ({}));
+            chatId = body.chat_id || null;
+          } catch (e) {}
+
+          if (!chatId) {
+            const allowList = (env.ALLOWED_CHAT_IDS || '')
+              .split(',')
+              .map((s) => s.trim())
+              .filter(Boolean);
+            if (allowList.length > 0) {
+              chatId = allowList[0];
+            }
+          }
+
+          const isSimpleStep = ['http', 'delay', 'notify'].includes(node.type);
+
+          if (isSimpleStep) {
+            // Run inside the Worker immediately!
+            const result = await executeSimpleNodeInWorker(env, node, chatId);
+            return new Response(JSON.stringify({
+              ok: true,
+              executed_inside: 'worker',
+              result
+            }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          } else if (node.type === 'run') {
+            // Construct a temporary single-node workflow and dispatch to GitHub Actions!
+            const tempWorkflow = {
+              name: `Test Node ${nodeId}`,
+              nodes: [node],
+              edges: []
+            };
+
+            const executionId = crypto.randomUUID();
+
+            await env.DB.prepare(
+              `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+            ).bind(
+              executionId,
+              id,
+              new Date().toISOString()
+            ).run();
+
+            const workerUrl = `${url.protocol}//${url.host}`;
+            await dispatchWorkflow(env, tempWorkflow, chatId, executionId, workerUrl);
+
+            return new Response(JSON.stringify({
+              ok: true,
+              executed_inside: 'actions',
+              execution_id: executionId
+            }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          } else {
+            return new Response(JSON.stringify({ ok: false, error: `Unsupported node type: ${node.type}` }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+        } catch (err) {
+          return new Response(JSON.stringify({ ok: false, error: err.message }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+    }
+
     if (request.method !== 'POST') {
       return new Response('OK', { status: 200 });
     }
@@ -120,15 +513,15 @@ export default {
 function validateWorkflow(workflow) {
   const errors = [];
   if (typeof workflow.name !== 'string' || !workflow.name.trim()) {
-    errors.push('"name" must be a non-empty string');
+    errors.push('workflow.name must be a non-empty string');
   }
 
   if (!Array.isArray(workflow.nodes)) {
-    errors.push('"nodes" must be an array');
+    errors.push('workflow.nodes must be an array');
     return errors;
   }
   if (workflow.nodes.length === 0) {
-    errors.push('"nodes" must not be empty');
+    errors.push('workflow.nodes must not be empty');
     return errors;
   }
   if (workflow.nodes.length > MAX_NODES) {
@@ -144,31 +537,41 @@ function validateWorkflow(workflow) {
     if (typeof node.id !== 'string' || !node.id.trim()) {
       errors.push(`node ${i}: "id" must be a non-empty string`);
     } else {
+      if (nodeIds.has(node.id)) {
+        errors.push(`node ${i}: duplicate "id" "${node.id}"`);
+      }
       nodeIds.add(node.id);
     }
 
     if (!ALLOWED_STEP_TYPES.has(node.type)) {
-      errors.push(`node ${i}: type must be one of ${[...ALLOWED_STEP_TYPES].join(', ')}`);
-      return;
+      errors.push(`node ${i} (${node.id || 'unnamed'}): unknown type "${node.type}" (allowed: ${[...ALLOWED_STEP_TYPES].join(', ')})`);
+    }
+
+    if (!node.position || typeof node.position !== 'object') {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): missing or invalid "position" object`);
+    } else {
+      if (typeof node.position.x !== 'number' || typeof node.position.y !== 'number') {
+        errors.push(`node ${i} (${node.id || 'unnamed'}): position "x" and "y" must be numbers`);
+      }
     }
 
     if (!node.config || typeof node.config !== 'object') {
-      errors.push(`node ${i}: missing or invalid "config" object`);
+      errors.push(`node ${i} (${node.id || 'unnamed'}): missing or invalid "config" object`);
       return;
     }
 
     const { config } = node;
     if (node.type === 'run' && typeof config.command !== 'string') {
-      errors.push(`node ${i}: "run" config needs a string "command"`);
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "run" config needs a string "command"`);
     }
     if (node.type === 'http' && typeof config.url !== 'string') {
-      errors.push(`node ${i}: "http" config needs a string "url"`);
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "http" config needs a string "url"`);
     }
     if (node.type === 'delay' && typeof config.ms !== 'number') {
-      errors.push(`node ${i}: "delay" config needs a numeric "ms"`);
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "delay" config needs a numeric "ms"`);
     }
     if (node.type === 'notify' && typeof config.message !== 'string') {
-      errors.push(`node ${i}: "notify" config needs a string "message"`);
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "notify" config needs a string "message"`);
     }
   });
 
@@ -178,18 +581,66 @@ function validateWorkflow(workflow) {
         errors.push(`edge ${i}: must be an object`);
         return;
       }
-      if (typeof edge.source !== 'string' || !nodeIds.has(edge.source)) {
+      if (typeof edge.source !== 'string' || !edge.source.trim()) {
+        errors.push(`edge ${i}: "source" must be a non-empty string`);
+      } else if (!nodeIds.has(edge.source)) {
         errors.push(`edge ${i}: source node "${edge.source}" does not exist`);
       }
-      if (typeof edge.target !== 'string' || !nodeIds.has(edge.target)) {
+
+      if (typeof edge.target !== 'string' || !edge.target.trim()) {
+        errors.push(`edge ${i}: "target" must be a non-empty string`);
+      } else if (!nodeIds.has(edge.target)) {
         errors.push(`edge ${i}: target node "${edge.target}" does not exist`);
       }
+
       if (edge.sourceHandle && !['success', 'failure', 'always'].includes(edge.sourceHandle)) {
-        errors.push(`edge ${i}: sourceHandle "${edge.sourceHandle}" is invalid`);
+        errors.push(`edge ${i}: sourceHandle "${edge.sourceHandle}" is invalid (must be "success", "failure", or "always")`);
       }
     });
+
+    // Cycle detection using DFS
+    const adj = {};
+    nodeIds.forEach(id => { adj[id] = []; });
+    workflow.edges.forEach(edge => {
+      if (adj[edge.source] && edge.target) {
+        adj[edge.source].push(edge.target);
+      }
+    });
+
+    const visited = {};
+    const recStack = {};
+
+    function hasCycle(nodeId) {
+      if (!visited[nodeId]) {
+        visited[nodeId] = true;
+        recStack[nodeId] = true;
+
+        const neighbors = adj[nodeId] || [];
+        for (const neighbor of neighbors) {
+          if (!visited[neighbor] && hasCycle(neighbor)) {
+            return true;
+          } else if (recStack[neighbor]) {
+            return true;
+          }
+        }
+      }
+      recStack[nodeId] = false;
+      return false;
+    }
+
+    let cycleDetected = false;
+    for (const nodeId of nodeIds) {
+      if (hasCycle(nodeId)) {
+        cycleDetected = true;
+        break;
+      }
+    }
+
+    if (cycleDetected) {
+      errors.push('workflow has cycles, but must be a Directed Acyclic Graph (DAG)');
+    }
   } else {
-    errors.push('"edges" must be an array');
+    errors.push('workflow.edges must be an array');
   }
 
   return errors;
@@ -399,4 +850,53 @@ function timingSafeEqual(a, b) {
   let result = 0;
   for (let i = 0; i < a.length; i++) result |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return result === 0;
+}
+
+async function executeSimpleNodeInWorker(env, node, chatId) {
+  const entry = { id: node.id, type: node.type, started_at: new Date().toISOString() };
+  const step = node.config || {};
+
+  try {
+    if (node.type === 'http') {
+      const timeoutMs = step.timeout_ms || 15000;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      let res;
+      try {
+        res = await fetch(step.url, {
+          method: step.method || 'GET',
+          headers: step.headers || {},
+          body: step.body ? (typeof step.body === 'string' ? step.body : JSON.stringify(step.body)) : undefined,
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      const text = await res.text();
+      entry.http_status = res.status;
+      entry.response = text.length > 4000 ? text.slice(0, 4000) + '…[truncated]' : text;
+      entry.status = res.ok ? 'success' : 'failed';
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } else if (node.type === 'delay') {
+      const ms = Math.min(step.ms || 0, 5 * 60_000); // cap at 5 minutes
+      await new Promise((r) => setTimeout(r, ms));
+      entry.status = 'success';
+    } else if (node.type === 'notify') {
+      if (!env.TELEGRAM_BOT_TOKEN) {
+        throw new Error("Telegram bot token is not configured");
+      }
+      if (!chatId) {
+        throw new Error("Telegram chat ID is missing");
+      }
+      await sendMessage(env, chatId, step.message);
+      entry.status = 'success';
+    } else {
+      throw new Error(`Unsupported simple node type: ${node.type}`);
+    }
+  } catch (err) {
+    entry.status = step.continue_on_error ? 'failed_ignored' : 'failed';
+    entry.error = err.message;
+  }
+  entry.finished_at = new Date().toISOString();
+  return entry;
 }
