@@ -1,11 +1,48 @@
 const ALLOWED_STEP_TYPES = new Set(['run', 'http', 'delay', 'notify']);
-const MAX_STEPS = 50;
+const MAX_NODES = 50;
 const MAX_FILE_SIZE_BYTES = 200_000; // 200 KB — plenty for a workflow definition
 const CONFIRM_TTL_SECONDS = 300; // pending workflows expire after 5 minutes
 const DEDUPE_TTL_SECONDS = 3600; // remember update_ids for an hour
 
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // Support execution feedback API: POST /executions/:id
+    if (request.method === 'POST' && url.pathname.startsWith('/executions/')) {
+      const execId = url.pathname.split('/').pop();
+      try {
+        const body = await request.json();
+        const { status, started_at, finished_at, log } = body;
+
+        if (env.DB) {
+          await env.DB.prepare(
+            `UPDATE executions
+             SET status = ?, started_at = ?, finished_at = ?, log = ?
+             WHERE id = ?`
+          )
+            .bind(
+              status || 'success',
+              started_at || null,
+              finished_at || null,
+              log ? JSON.stringify(log) : null,
+              execId
+            )
+            .run();
+        }
+
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ ok: false, error: err.message }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+    }
+
     if (request.method !== 'POST') {
       return new Response('OK', { status: 200 });
     }
@@ -58,7 +95,7 @@ export default {
       if (message.document) {
         await handleDocument(message, env, chatId);
       } else if (message.text && message.text.startsWith('/confirm')) {
-        await handleConfirm(env, chatId, message.text);
+        await handleConfirm(env, chatId, message.text, request.url);
       } else if (message.text === '/cancel') {
         await handleCancel(env, chatId);
       } else if (message.text === '/whoami' || message.text === '/start') {
@@ -85,44 +122,94 @@ function validateWorkflow(workflow) {
   if (typeof workflow.name !== 'string' || !workflow.name.trim()) {
     errors.push('"name" must be a non-empty string');
   }
-  if (!Array.isArray(workflow.steps) || workflow.steps.length === 0) {
-    errors.push('"steps" must be a non-empty array');
+
+  if (!Array.isArray(workflow.nodes)) {
+    errors.push('"nodes" must be an array');
     return errors;
   }
-  if (workflow.steps.length > MAX_STEPS) {
-    errors.push(`too many steps (max ${MAX_STEPS})`);
+  if (workflow.nodes.length === 0) {
+    errors.push('"nodes" must not be empty');
+    return errors;
   }
-  workflow.steps.forEach((step, i) => {
-    if (!step || typeof step !== 'object' || !ALLOWED_STEP_TYPES.has(step.type)) {
-      errors.push(`step ${i}: type must be one of ${[...ALLOWED_STEP_TYPES].join(', ')}`);
+  if (workflow.nodes.length > MAX_NODES) {
+    errors.push(`too many nodes (max ${MAX_NODES})`);
+  }
+
+  const nodeIds = new Set();
+  workflow.nodes.forEach((node, i) => {
+    if (!node || typeof node !== 'object') {
+      errors.push(`node ${i}: must be an object`);
       return;
     }
-    if (step.type === 'run' && typeof step.command !== 'string') {
-      errors.push(`step ${i}: "run" needs a string "command"`);
+    if (typeof node.id !== 'string' || !node.id.trim()) {
+      errors.push(`node ${i}: "id" must be a non-empty string`);
+    } else {
+      nodeIds.add(node.id);
     }
-    if (step.type === 'http' && typeof step.url !== 'string') {
-      errors.push(`step ${i}: "http" needs a string "url"`);
+
+    if (!ALLOWED_STEP_TYPES.has(node.type)) {
+      errors.push(`node ${i}: type must be one of ${[...ALLOWED_STEP_TYPES].join(', ')}`);
+      return;
     }
-    if (step.type === 'delay' && typeof step.ms !== 'number') {
-      errors.push(`step ${i}: "delay" needs a numeric "ms"`);
+
+    if (!node.config || typeof node.config !== 'object') {
+      errors.push(`node ${i}: missing or invalid "config" object`);
+      return;
     }
-    if (step.type === 'notify' && typeof step.message !== 'string') {
-      errors.push(`step ${i}: "notify" needs a string "message"`);
+
+    const { config } = node;
+    if (node.type === 'run' && typeof config.command !== 'string') {
+      errors.push(`node ${i}: "run" config needs a string "command"`);
+    }
+    if (node.type === 'http' && typeof config.url !== 'string') {
+      errors.push(`node ${i}: "http" config needs a string "url"`);
+    }
+    if (node.type === 'delay' && typeof config.ms !== 'number') {
+      errors.push(`node ${i}: "delay" config needs a numeric "ms"`);
+    }
+    if (node.type === 'notify' && typeof config.message !== 'string') {
+      errors.push(`node ${i}: "notify" config needs a string "message"`);
     }
   });
+
+  if (Array.isArray(workflow.edges)) {
+    workflow.edges.forEach((edge, i) => {
+      if (!edge || typeof edge !== 'object') {
+        errors.push(`edge ${i}: must be an object`);
+        return;
+      }
+      if (typeof edge.source !== 'string' || !nodeIds.has(edge.source)) {
+        errors.push(`edge ${i}: source node "${edge.source}" does not exist`);
+      }
+      if (typeof edge.target !== 'string' || !nodeIds.has(edge.target)) {
+        errors.push(`edge ${i}: target node "${edge.target}" does not exist`);
+      }
+      if (edge.sourceHandle && !['success', 'failure', 'always'].includes(edge.sourceHandle)) {
+        errors.push(`edge ${i}: sourceHandle "${edge.sourceHandle}" is invalid`);
+      }
+    });
+  } else {
+    errors.push('"edges" must be an array');
+  }
+
   return errors;
 }
 
 function summarizeWorkflow(workflow) {
-  return workflow.steps
-    .map((s, i) => {
-      if (s.type === 'run') return `${i + 1}. run:    ${s.command}`;
-      if (s.type === 'http') return `${i + 1}. http:   ${s.method || 'GET'} ${s.url}`;
-      if (s.type === 'delay') return `${i + 1}. delay:  ${s.ms}ms`;
-      if (s.type === 'notify') return `${i + 1}. notify: "${s.message}"`;
-      return `${i + 1}. ${s.type}`;
-    })
-    .join('\n');
+  let summary = `Nodes:\n`;
+  workflow.nodes.forEach((n, i) => {
+    if (n.type === 'run') summary += `  - [${n.id}] run: ${n.config.command}\n`;
+    else if (n.type === 'http') summary += `  - [${n.id}] http: ${n.config.method || 'GET'} ${n.config.url}\n`;
+    else if (n.type === 'delay') summary += `  - [${n.id}] delay: ${n.config.ms}ms\n`;
+    else if (n.type === 'notify') summary += `  - [${n.id}] notify: "${n.config.message}"\n`;
+  });
+  if (workflow.edges && workflow.edges.length > 0) {
+    summary += `Edges:\n`;
+    workflow.edges.forEach((e) => {
+      summary += `  - ${e.source} -> ${e.target} (${e.sourceHandle || 'success'})\n`;
+    });
+  }
+  return summary;
 }
 
 async function handleDocument(message, env, chatId) {
@@ -163,12 +250,7 @@ async function handleDocument(message, env, chatId) {
     return;
   }
 
-  // --- Safety net: never dispatch straight from an inbound file. Stage it
-  // and require an explicit /confirm reply with a fresh, single-use token.
-  // This means a forwarded chat ID, a Telegram retry, or a fat-fingered send
-  // can't silently trigger arbitrary shell commands on a GitHub runner. It
-  // is *not* a sandbox — see the README's security model for what it does
-  // and doesn't protect against.
+  // Stage workflow and require explicit /confirm
   const token = crypto.randomUUID().slice(0, 8);
   const pendingKey = `pending:${chatId}`;
   await env.WORKFLOW_STATE.put(
@@ -180,12 +262,12 @@ async function handleDocument(message, env, chatId) {
   const summary = summarizeWorkflow(workflow);
   await sendMessage(
     env, chatId,
-    `Received "${workflow.name}" (${workflow.steps.length} step(s)):\n\n${summary}\n\n` +
+    `Received "${workflow.name}" (${workflow.nodes.length} node(s)):\n\n${summary}\n\n` +
     `Reply "/confirm ${token}" within ${CONFIRM_TTL_SECONDS / 60} minutes to run it, or /cancel to discard.`
   );
 }
 
-async function handleConfirm(env, chatId, text) {
+async function handleConfirm(env, chatId, text, requestUrl) {
   const token = text.trim().split(/\s+/)[1];
   const pendingKey = `pending:${chatId}`;
   const raw = await env.WORKFLOW_STATE.get(pendingKey);
@@ -200,8 +282,72 @@ async function handleConfirm(env, chatId, text) {
   }
 
   await env.WORKFLOW_STATE.delete(pendingKey);
-  await dispatchWorkflow(env, pending.workflow, chatId);
-  await sendMessage(env, chatId, `Dispatched "${pending.workflow.name}" to GitHub Actions — you'll get a message when it finishes.`);
+
+  const workflow = pending.workflow;
+  const workflowId = workflow.name.replace(/[^a-z0-9_-]/gi, '_');
+
+  // Insert/Replace workflow, nodes, and edges in D1
+  if (env.DB) {
+    // We transactionally save or just execute sequentially since Cloudflare DB handles statements in order
+    await env.DB.prepare(`INSERT OR REPLACE INTO workflows (id, name) VALUES (?, ?)`).bind(workflowId, workflow.name).run();
+
+    // Clear old nodes and edges
+    await env.DB.prepare(`DELETE FROM nodes WHERE workflow_id = ?`).bind(workflowId).run();
+    await env.DB.prepare(`DELETE FROM edges WHERE workflow_id = ?`).bind(workflowId).run();
+
+    // Insert new nodes
+    const nodeStmts = workflow.nodes.map(node => {
+      return env.DB.prepare(
+        `INSERT INTO nodes (id, workflow_id, type, position_x, position_y, config) VALUES (?, ?, ?, ?, ?, ?)`
+      ).bind(
+        node.id,
+        workflowId,
+        node.type,
+        node.position.x,
+        node.position.y,
+        JSON.stringify(node.config)
+      );
+    });
+
+    // Insert new edges
+    const edgeStmts = workflow.edges.map(edge => {
+      return env.DB.prepare(
+        `INSERT INTO edges (workflow_id, source, target, source_handle) VALUES (?, ?, ?, ?)`
+      ).bind(
+        workflowId,
+        edge.source,
+        edge.target,
+        edge.sourceHandle || 'success'
+      );
+    });
+
+    if (nodeStmts.length > 0) {
+      await env.DB.batch(nodeStmts);
+    }
+    if (edgeStmts.length > 0) {
+      await env.DB.batch(edgeStmts);
+    }
+  }
+
+  const executionId = crypto.randomUUID();
+
+  // Create execution record in D1
+  if (env.DB) {
+    await env.DB.prepare(
+      `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+    ).bind(
+      executionId,
+      workflowId,
+      new Date().toISOString()
+    ).run();
+  }
+
+  // Get current worker domain / origin
+  const parsedUrl = new URL(requestUrl);
+  const workerUrl = `${parsedUrl.protocol}//${parsedUrl.host}`;
+
+  await dispatchWorkflow(env, workflow, chatId, executionId, workerUrl);
+  await sendMessage(env, chatId, `Dispatched "${workflow.name}" to GitHub Actions — you'll get a message when it finishes.`);
 }
 
 async function handleCancel(env, chatId) {
@@ -209,7 +355,7 @@ async function handleCancel(env, chatId) {
   await sendMessage(env, chatId, 'Discarded.');
 }
 
-async function dispatchWorkflow(env, workflow, chatId) {
+async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl) {
   const res = await fetch(
     `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/dispatches`,
     {
@@ -222,7 +368,12 @@ async function dispatchWorkflow(env, workflow, chatId) {
       },
       body: JSON.stringify({
         event_type: 'run-workflow',
-        client_payload: { payload: workflow, chat_id: chatId },
+        client_payload: {
+          payload: workflow,
+          chat_id: chatId,
+          execution_id: executionId,
+          worker_url: workerUrl
+        },
       }),
     }
   );

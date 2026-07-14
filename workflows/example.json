@@ -1,10 +1,68 @@
 {
   "$schema": "./workflow.schema.json",
   "name": "hello-world",
-  "steps": [
-    { "type": "run", "command": "echo 'Hello from GitHub Actions!' && date -u" },
-    { "type": "http", "method": "GET", "url": "https://api.github.com/zen" },
-    { "type": "delay", "ms": 1000 },
-    { "type": "notify", "message": "hello-world workflow reached its final step" }
+  "nodes": [
+    {
+      "id": "node_1",
+      "type": "run",
+      "position": {
+        "x": 100,
+        "y": 100
+      },
+      "config": {
+        "command": "echo 'Hello from GitHub Actions!' && date -u"
+      }
+    },
+    {
+      "id": "node_2",
+      "type": "http",
+      "position": {
+        "x": 100,
+        "y": 250
+      },
+      "config": {
+        "method": "GET",
+        "url": "https://api.github.com/zen"
+      }
+    },
+    {
+      "id": "node_3",
+      "type": "delay",
+      "position": {
+        "x": 100,
+        "y": 400
+      },
+      "config": {
+        "ms": 1000
+      }
+    },
+    {
+      "id": "node_4",
+      "type": "notify",
+      "position": {
+        "x": 100,
+        "y": 550
+      },
+      "config": {
+        "message": "hello-world workflow reached its final step"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "source": "node_1",
+      "target": "node_2",
+      "sourceHandle": "success"
+    },
+    {
+      "source": "node_2",
+      "target": "node_3",
+      "sourceHandle": "success"
+    },
+    {
+      "source": "node_3",
+      "target": "node_4",
+      "sourceHandle": "success"
+    }
   ]
 }
