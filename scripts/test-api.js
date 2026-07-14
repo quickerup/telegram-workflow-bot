@@ -1,5 +1,6 @@
 const { spawn } = require('child_process');
 const http = require('http');
+const fs = require('fs');
 
 async function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -11,10 +12,16 @@ async function request(options, body = null) {
       let data = '';
       res.on('data', chunk => { data += chunk; });
       res.on('end', () => {
+        let parsed = null;
+        try {
+          parsed = data ? JSON.parse(data) : null;
+        } catch (e) {
+          parsed = data;
+        }
         resolve({
           statusCode: res.statusCode,
           headers: res.headers,
-          body: data ? JSON.parse(data) : null
+          body: parsed
         });
       });
     });
@@ -30,6 +37,14 @@ async function request(options, body = null) {
   console.log('Initializing local test D1 database schema...');
   // Ensure we've run d1 execute locally first, though we did it in bash, let's make sure it's done.
 
+  console.log('Writing temporary worker/.dev.vars...');
+  fs.writeFileSync('worker/.dev.vars', `
+TELEGRAM_BOT_TOKEN=123456:fake-token
+TELEGRAM_WEBHOOK_SECRET=secret
+GITHUB_PAT=github_pat_fake
+ALLOWED_CHAT_IDS=12345
+  `.trim());
+
   console.log('Starting wrangler dev server...');
   const devServer = spawn('npx', ['wrangler', 'dev', '--port', '8787'], {
     cwd: 'worker',
@@ -42,12 +57,12 @@ async function request(options, body = null) {
     }
   });
 
-  // Log output for debugging if needed, but keep it quiet
+  // Log output for debugging
   devServer.stdout.on('data', (data) => {
-    // console.log(`[wrangler] ${data}`);
+    console.log(`[wrangler] ${data}`);
   });
   devServer.stderr.on('data', (data) => {
-    // console.error(`[wrangler err] ${data}`);
+    console.error(`[wrangler err] ${data}`);
   });
 
   // Wait for wrangler dev to be ready
@@ -286,12 +301,209 @@ async function request(options, body = null) {
       throw new Error(`Expected execute full graph to attempt Actions dispatch and fail on PAT, but got status ${resExecuteFull.statusCode} with body: ${JSON.stringify(resExecuteFull.body)}`);
     }
 
+    // 9. Test Webhook trigger: POST workflow with webhook_trigger, then trigger via webhook
+    console.log('Test 9: Webhook trigger test...');
+    const webhookWorkflow = {
+      name: "Webhook Test Workflow",
+      nodes: [
+        {
+          id: "node_webhook",
+          type: "webhook_trigger",
+          position: { x: 100, y: 150 },
+          config: {}
+        },
+        {
+          id: "node_notify",
+          type: "notify",
+          position: { x: 300, y: 150 },
+          config: { message: "Webhook triggered successfully!" }
+        }
+      ],
+      edges: [
+        {
+          source: "node_webhook",
+          target: "node_notify",
+          sourceHandle: "success"
+        }
+      ]
+    };
+
+    // Save webhook workflow
+    const resSaveWebhook = await request({
+      hostname: 'localhost',
+      port: 8787,
+      path: '/api/workflows',
+      method: 'POST',
+      headers: {
+        'Cf-Access-Authenticated-User-Email': 'user@example.com',
+        'Content-Type': 'application/json'
+      }
+    }, webhookWorkflow);
+
+    if (resSaveWebhook.statusCode !== 200) {
+      throw new Error(`Expected 200 saving webhook workflow, got ${resSaveWebhook.statusCode}`);
+    }
+    const webhookWfId = resSaveWebhook.body.workflow.id;
+    console.log(`Saved webhook workflow with ID: ${webhookWfId}`);
+
+    // POST to /webhooks/:id
+    const resTriggerWebhook = await request({
+      hostname: 'localhost',
+      port: 8787,
+      path: `/webhooks/${webhookWfId}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    }, { test: "payload" });
+
+    if (resTriggerWebhook.statusCode === 500 && resTriggerWebhook.body.error && resTriggerWebhook.body.error.includes('GitHub dispatch failed')) {
+      console.log('Test 9 passed (attempted GitHub dispatch as expected)!');
+    } else if (resTriggerWebhook.statusCode === 200 && resTriggerWebhook.body.ok) {
+      console.log('Test 9 passed (webhook dispatch succeeded)!');
+    } else {
+      throw new Error(`Expected webhook trigger to attempt Actions dispatch, but got status ${resTriggerWebhook.statusCode} with body: ${JSON.stringify(resTriggerWebhook.body)}`);
+    }
+
+    // 10. Test Telegram Event trigger: POST workflow with telegram_event_trigger (edited_message), then POST Telegram update to /
+    console.log('Test 10: Telegram event trigger test...');
+    const telegramEventWorkflow = {
+      name: "Telegram Event Test Workflow",
+      nodes: [
+        {
+          id: "node_tg_trigger",
+          type: "telegram_event_trigger",
+          position: { x: 100, y: 150 },
+          config: {
+            event_type: "edited_message"
+          }
+        },
+        {
+          id: "node_notify",
+          type: "notify",
+          position: { x: 300, y: 150 },
+          config: { message: "Telegram event triggered!" }
+        }
+      ],
+      edges: [
+        {
+          source: "node_tg_trigger",
+          target: "node_notify",
+          sourceHandle: "success"
+        }
+      ]
+    };
+
+    // Save Telegram event workflow
+    const resSaveTg = await request({
+      hostname: 'localhost',
+      port: 8787,
+      path: '/api/workflows',
+      method: 'POST',
+      headers: {
+        'Cf-Access-Authenticated-User-Email': 'user@example.com',
+        'Content-Type': 'application/json'
+      }
+    }, telegramEventWorkflow);
+
+    if (resSaveTg.statusCode !== 200) {
+      throw new Error(`Expected 200 saving Telegram event workflow, got ${resSaveTg.statusCode}`);
+    }
+    const tgWfId = resSaveTg.body.workflow.id;
+    console.log(`Saved telegram_event workflow with ID: ${tgWfId}`);
+
+    // POST Telegram update (edited_message) to main bot webhook /
+    const resTriggerTg = await request({
+      hostname: 'localhost',
+      port: 8787,
+      path: '/',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Telegram-Bot-Api-Secret-Token': 'secret'
+      }
+    }, {
+      update_id: 99991,
+      edited_message: {
+        message_id: 123,
+        chat: { id: 12345 },
+        text: "edited text"
+      }
+    });
+
+    if (resTriggerTg.statusCode !== 200) {
+      throw new Error(`Expected 200 from Telegram webhook, got ${resTriggerTg.statusCode}`);
+    }
+    console.log('Test 10 passed (Telegram webhook responded 200 OK)!');
+
+    // 11. Test Scheduled/Cron trigger: POST workflow with cron_trigger (* * * * *), then invoke scheduled endpoint
+    console.log('Test 11: Cron/scheduled trigger test...');
+    const cronWorkflow = {
+      name: "Cron Test Workflow",
+      nodes: [
+        {
+          id: "node_cron",
+          type: "cron_trigger",
+          position: { x: 100, y: 150 },
+          config: {
+            cron: "* * * * *"
+          }
+        },
+        {
+          id: "node_notify",
+          type: "notify",
+          position: { x: 300, y: 150 },
+          config: { message: "Cron triggered!" }
+        }
+      ],
+      edges: [
+        {
+          source: "node_cron",
+          target: "node_notify",
+          sourceHandle: "success"
+        }
+      ]
+    };
+
+    // Save cron workflow
+    const resSaveCron = await request({
+      hostname: 'localhost',
+      port: 8787,
+      path: '/api/workflows',
+      method: 'POST',
+      headers: {
+        'Cf-Access-Authenticated-User-Email': 'user@example.com',
+        'Content-Type': 'application/json'
+      }
+    }, cronWorkflow);
+
+    if (resSaveCron.statusCode !== 200) {
+      throw new Error(`Expected 200 saving cron workflow, got ${resSaveCron.statusCode}`);
+    }
+    const cronWfId = resSaveCron.body.workflow.id;
+    console.log(`Saved cron workflow with ID: ${cronWfId}`);
+
+    // Trigger scheduled endpoint: GET /__scheduled
+    const resTriggerCron = await request({
+      hostname: 'localhost',
+      port: 8787,
+      path: '/__scheduled',
+      method: 'GET'
+    });
+
+    if (resTriggerCron.statusCode !== 200 && resTriggerCron.statusCode !== 202) {
+      throw new Error(`Expected 200/202 from __scheduled, got ${resTriggerCron.statusCode}`);
+    }
+    console.log('Test 11 passed (__scheduled responded successfully)!');
+
     console.log('\nAll integration tests passed successfully!');
+    try { fs.unlinkSync('worker/.dev.vars'); } catch (e) {}
     devServer.kill();
     process.exit(0);
 
   } catch (err) {
     console.error('\nTest suite failed:', err);
+    try { fs.unlinkSync('worker/.dev.vars'); } catch (e) {}
     devServer.kill();
     process.exit(1);
   }

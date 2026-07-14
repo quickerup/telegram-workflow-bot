@@ -11,7 +11,7 @@
 const fs = require('fs');
 const { execSync } = require('child_process');
 
-const ALLOWED_TYPES = new Set(['run', 'http', 'delay', 'notify']);
+const ALLOWED_TYPES = new Set(['run', 'http', 'delay', 'notify', 'webhook_trigger', 'cron_trigger', 'telegram_event_trigger']);
 const MAX_NODES = 50;
 const DEFAULT_RUN_TIMEOUT_MS = 60_000;
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
@@ -122,6 +122,8 @@ async function runNode(node, index) {
       entry.status = 'success';
     } else if (node.type === 'notify') {
       await sendTelegramMessage(step.message);
+      entry.status = 'success';
+    } else if (node.type === 'webhook_trigger' || node.type === 'cron_trigger' || node.type === 'telegram_event_trigger') {
       entry.status = 'success';
     }
   } catch (err) {
