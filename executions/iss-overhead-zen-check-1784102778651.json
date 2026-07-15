@@ -1,0 +1,68 @@
+{
+  "name": "iss-overhead-zen-check",
+  "started_at": "2026-07-15T08:06:17.293Z",
+  "steps": [
+    {
+      "id": "trigger_1",
+      "index": 0,
+      "type": "webhook_trigger",
+      "started_at": "2026-07-15T08:06:17.293Z",
+      "inputs": {},
+      "resolved_inputs": {},
+      "resolved_config": {},
+      "outputs": {},
+      "status": "success",
+      "finished_at": "2026-07-15T08:06:17.294Z"
+    },
+    {
+      "id": "node_1",
+      "index": 1,
+      "type": "http",
+      "started_at": "2026-07-15T08:06:17.294Z",
+      "inputs": {},
+      "resolved_inputs": {},
+      "resolved_config": {
+        "continue_on_error": true,
+        "method": "GET",
+        "url": "http://api.open-notify.org/iss-now.json"
+      },
+      "http_status": 200,
+      "response": "{\"message\": \"success\", \"iss_position\": {\"longitude\": \"-48.2425\", \"latitude\": \"-29.0732\"}, \"timestamp\": 1784102778}",
+      "outputs": {
+        "response": {
+          "message": "success",
+          "iss_position": {
+            "longitude": "-48.2425",
+            "latitude": "-29.0732"
+          },
+          "timestamp": 1784102778
+        },
+        "status": 200
+      },
+      "status": "success",
+      "finished_at": "2026-07-15T08:06:18.650Z"
+    },
+    {
+      "id": "node_2",
+      "index": 2,
+      "type": "notify",
+      "started_at": "2026-07-15T08:06:18.650Z",
+      "inputs": {
+        "zen_phrase": "Right now, three humans are floating above your problems at 17,500 mph. Yours can wait a minute."
+      },
+      "resolved_inputs": {
+        "zen_phrase": "Right now, three humans are floating above your problems at 17,500 mph. Yours can wait a minute."
+      },
+      "resolved_config": {
+        "message": "ISS ping succeeded — coords: {{node_1.response.iss_position}}"
+      },
+      "outputs": {
+        "message": "ISS ping succeeded — coords: {{node_1.response.iss_position}}"
+      },
+      "status": "success",
+      "finished_at": "2026-07-15T08:06:18.650Z"
+    }
+  ],
+  "status": "success",
+  "finished_at": "2026-07-15T08:06:18.650Z"
+}
