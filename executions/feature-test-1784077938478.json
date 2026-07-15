@@ -1,0 +1,60 @@
+{
+  "name": "feature-test",
+  "started_at": "2026-07-15T01:12:18.342Z",
+  "steps": [
+    {
+      "id": "trigger_1",
+      "index": 0,
+      "type": "webhook_trigger",
+      "started_at": "2026-07-15T01:12:18.342Z",
+      "inputs": {},
+      "resolved_inputs": {},
+      "resolved_config": {},
+      "status": "success",
+      "finished_at": "2026-07-15T01:12:18.343Z"
+    },
+    {
+      "id": "node_1",
+      "index": 1,
+      "type": "http",
+      "started_at": "2026-07-15T01:12:18.343Z",
+      "inputs": {},
+      "resolved_inputs": {},
+      "resolved_config": {
+        "continue_on_error": true,
+        "method": "GET",
+        "url": "https://api.github.com/zen"
+      },
+      "http_status": 200,
+      "response": "Practicality beats purity.",
+      "outputs": {
+        "response": "Practicality beats purity.",
+        "status": 200
+      },
+      "status": "success",
+      "finished_at": "2026-07-15T01:12:18.477Z"
+    },
+    {
+      "id": "node_2",
+      "index": 2,
+      "type": "notify",
+      "started_at": "2026-07-15T01:12:18.477Z",
+      "inputs": {
+        "zen_phrase": "{{ nodes.node_1.outputs.response }}"
+      },
+      "resolved_inputs": {
+        "zen_phrase": "Practicality beats purity."
+      },
+      "resolved_config": {
+        "message": "Success path! Zen quote: Practicality beats purity."
+      },
+      "outputs": {
+        "message": "Success path! Zen quote: Practicality beats purity."
+      },
+      "status": "success",
+      "finished_at": "2026-07-15T01:12:18.478Z"
+    }
+  ],
+  "status": "success",
+  "finished_at": "2026-07-15T01:12:18.478Z"
+}
