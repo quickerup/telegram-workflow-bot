@@ -11,7 +11,15 @@
 const fs = require('fs');
 const { execSync } = require('child_process');
 
-const ALLOWED_TYPES = new Set(['run', 'http', 'delay', 'notify']);
+const ALLOWED_TYPES = new Set([
+  'run',
+  'http',
+  'delay',
+  'notify',
+  'webhook_trigger',
+  'cron_trigger',
+  'telegram_event_trigger'
+]);
 const MAX_NODES = 50;
 const DEFAULT_RUN_TIMEOUT_MS = 60_000;
 const DEFAULT_HTTP_TIMEOUT_MS = 15_000;
@@ -32,6 +40,7 @@ const workflow = data.payload || data;
 const chatId = data.chat_id;
 const executionId = data.execution_id;
 const workerUrl = data.worker_url;
+const triggerData = data.trigger_data || null;
 
 const nodes = Array.isArray(workflow.nodes) ? workflow.nodes : [];
 const edges = Array.isArray(workflow.edges) ? workflow.edges : [];
@@ -121,7 +130,7 @@ function interpolate(value, nodeResults) {
   return value;
 }
 
-async function runNode(node, index, nodeResults) {
+async function runNode(node, index, nodeResults, triggerData) {
   const entry = { id: node.id, index, type: node.type, started_at: new Date().toISOString() };
 
   if (!ALLOWED_TYPES.has(node.type)) {
@@ -193,6 +202,20 @@ async function runNode(node, index, nodeResults) {
       await sendTelegramMessage(step.message);
       entry.outputs = { message: step.message };
       entry.status = 'success';
+    } else if (node.type === 'webhook_trigger' || node.type === 'cron_trigger' || node.type === 'telegram_event_trigger') {
+      entry.status = 'success';
+      if (triggerData) {
+        entry.outputs = {
+          payload: triggerData.payload,
+          headers: triggerData.headers,
+          query: triggerData.query,
+          cron: triggerData.cron,
+          event_type: triggerData.event_type,
+          trigger_type: triggerData.trigger_type
+        };
+      } else {
+        entry.outputs = {};
+      }
     }
   } catch (err) {
     entry.status = step.continue_on_error ? 'failed_ignored' : (entry.status || 'failed');
@@ -256,7 +279,7 @@ async function runNode(node, index, nodeResults) {
 
     let entry;
     try {
-      entry = await runNode(node, index++, nodeResults);
+      entry = await runNode(node, index++, nodeResults, triggerData);
       log.steps.push(entry);
       nodeResults[currentId] = entry;
       executed.add(currentId);

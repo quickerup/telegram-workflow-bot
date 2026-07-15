@@ -1,4 +1,12 @@
-const ALLOWED_STEP_TYPES = new Set(['run', 'http', 'delay', 'notify']);
+const ALLOWED_STEP_TYPES = new Set([
+  'run',
+  'http',
+  'delay',
+  'notify',
+  'webhook_trigger',
+  'cron_trigger',
+  'telegram_event_trigger'
+]);
 const MAX_NODES = 50;
 const MAX_FILE_SIZE_BYTES = 200_000; // 200 KB — plenty for a workflow definition
 const CONFIRM_TTL_SECONDS = 300; // pending workflows expire after 5 minutes
@@ -7,6 +15,136 @@ const DEDUPE_TTL_SECONDS = 3600; // remember update_ids for an hour
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
+
+    // Webhook Trigger Endpoint: POST /webhooks/:workflowId
+    if (request.method === 'POST' && url.pathname.startsWith('/webhooks/')) {
+      const parts = url.pathname.split('/');
+      if (parts.length === 3) {
+        const id = parts[2];
+        try {
+          if (!env.DB) {
+            throw new Error('Database is not configured');
+          }
+
+          const workflowRow = await env.DB.prepare(
+            `SELECT id, name FROM workflows WHERE id = ?`
+          ).bind(id).first();
+
+          if (!workflowRow) {
+            return new Response(JSON.stringify({ ok: false, error: 'Workflow not found' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const { results: nodesRows } = await env.DB.prepare(
+            `SELECT id, type, config FROM nodes WHERE workflow_id = ?`
+          ).bind(id).all();
+
+          const webhookNodes = nodesRows.filter(row => row.type === 'webhook_trigger');
+          if (webhookNodes.length === 0) {
+            return new Response(JSON.stringify({ ok: false, error: 'This workflow does not have a webhook trigger' }), {
+              status: 400,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const querySecret = url.searchParams.get('secret');
+          const headerSecret = request.headers.get('X-Webhook-Secret');
+
+          let validated = false;
+          for (const nodeRow of webhookNodes) {
+            const config = JSON.parse(nodeRow.config);
+            if (!config.secret) {
+              validated = true;
+              break;
+            }
+            if (config.secret === querySecret || config.secret === headerSecret) {
+              validated = true;
+              break;
+            }
+          }
+
+          if (!validated) {
+            return new Response(JSON.stringify({ ok: false, error: 'Unauthorized: invalid or missing webhook secret' }), {
+              status: 401,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          const { results: edgesRows } = await env.DB.prepare(
+            `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
+          ).bind(id).all();
+
+          const nodes = nodesRows.map(row => ({
+            id: row.id,
+            type: row.type,
+            position: { x: 0, y: 0 },
+            config: JSON.parse(row.config)
+          }));
+
+          const edges = edgesRows.map(row => ({
+            source: row.source,
+            target: row.target,
+            sourceHandle: row.source_handle || 'success'
+          }));
+
+          const workflowObj = {
+            id: workflowRow.id,
+            name: workflowRow.name,
+            nodes,
+            edges
+          };
+
+          let postBody = null;
+          try {
+            const contentType = request.headers.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+              postBody = await request.json();
+            } else {
+              postBody = await request.text();
+            }
+          } catch (e) {}
+
+          const executionId = crypto.randomUUID();
+
+          await env.DB.prepare(
+            `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+          ).bind(
+            executionId,
+            id,
+            new Date().toISOString()
+          ).run();
+
+          let chatId = null;
+          const allowList = (env.ALLOWED_CHAT_IDS || '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
+          if (allowList.length > 0) {
+            chatId = allowList[0];
+          }
+
+          const workerUrl = `${url.protocol}//${url.host}`;
+          await dispatchWorkflow(env, workflowObj, chatId, executionId, workerUrl, {
+            trigger_type: 'webhook',
+            payload: postBody,
+            headers: Object.fromEntries(request.headers.entries()),
+            query: Object.fromEntries(url.searchParams.entries())
+          });
+
+          return new Response(JSON.stringify({ ok: true, execution_id: executionId }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        } catch (err) {
+          return new Response(JSON.stringify({ ok: false, error: err.message }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+      }
+    }
 
     // Support execution feedback API: POST /executions/:id
     if (request.method === 'POST' && url.pathname.startsWith('/executions/')) {
@@ -496,6 +634,15 @@ export default {
       await env.WORKFLOW_STATE.put(dedupeKey, '1', { expirationTtl: DEDUPE_TTL_SECONDS });
     }
 
+    // Telegram Event Triggers: Check if this update matches any telegram_event_trigger workflow
+    if (env.DB) {
+      try {
+        await handleTelegramEventTriggers(env, update, request.url);
+      } catch (err) {
+        console.error("Telegram event trigger error:", err);
+      }
+    }
+
     const message = update.message;
     if (!message) return new Response('OK');
 
@@ -539,6 +686,13 @@ export default {
 
     return new Response('OK');
   },
+
+  // Cron/Schedule Trigger Handler via Scheduled Events
+  async scheduled(event, env, ctx) {
+    if (!env.DB) return;
+    const now = new Date(event.scheduledTime || Date.now());
+    ctx.waitUntil(handleScheduledTriggers(env, now));
+  }
 };
 
 function validateWorkflow(workflow) {
@@ -611,6 +765,17 @@ function validateWorkflow(workflow) {
     }
     if (node.type === 'notify' && typeof config.message !== 'string') {
       errors.push(`node ${i} (${node.id || 'unnamed'}): "notify" config needs a string "message"`);
+    }
+    if (node.type === 'webhook_trigger') {
+      if (config.secret !== undefined && typeof config.secret !== 'string') {
+        errors.push(`node ${i} (${node.id || 'unnamed'}): "webhook_trigger" config "secret" must be a string`);
+      }
+    }
+    if (node.type === 'cron_trigger' && typeof config.cron !== 'string') {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "cron_trigger" config needs a string "cron"`);
+    }
+    if (node.type === 'telegram_event_trigger' && typeof config.event_type !== 'string') {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "telegram_event_trigger" config needs a string "event_type"`);
     }
   });
 
@@ -692,6 +857,9 @@ function summarizeWorkflow(workflow) {
     else if (n.type === 'http') summary += `  - [${n.id}] http: ${n.config.method || 'GET'} ${n.config.url}\n`;
     else if (n.type === 'delay') summary += `  - [${n.id}] delay: ${n.config.ms}ms\n`;
     else if (n.type === 'notify') summary += `  - [${n.id}] notify: "${n.config.message}"\n`;
+    else if (n.type === 'webhook_trigger') summary += `  - [${n.id}] webhook_trigger: ${n.config.secret ? '(has secret)' : '(no secret)'}\n`;
+    else if (n.type === 'cron_trigger') summary += `  - [${n.id}] cron_trigger: "${n.config.cron}"\n`;
+    else if (n.type === 'telegram_event_trigger') summary += `  - [${n.id}] telegram_event_trigger: "${n.config.event_type}"\n`;
   });
   if (workflow.edges && workflow.edges.length > 0) {
     summary += `Edges:\n`;
@@ -849,7 +1017,7 @@ async function handleCancel(env, chatId) {
   await sendMessage(env, chatId, 'Discarded.');
 }
 
-async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl) {
+async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl, triggerData = null) {
   const res = await fetch(
     `https://api.github.com/repos/${env.GITHUB_OWNER}/${env.GITHUB_REPO}/dispatches`,
     {
@@ -866,7 +1034,8 @@ async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl) {
           payload: workflow,
           chat_id: chatId,
           execution_id: executionId,
-          worker_url: workerUrl
+          worker_url: workerUrl,
+          trigger_data: triggerData
         },
       }),
     }
@@ -942,4 +1111,236 @@ async function executeSimpleNodeInWorker(env, node, chatId) {
   }
   entry.finished_at = new Date().toISOString();
   return entry;
+}
+
+async function getWorkflowObj(env, id) {
+  const workflowRow = await env.DB.prepare(
+    `SELECT id, name, created_at FROM workflows WHERE id = ?`
+  ).bind(id).first();
+
+  if (!workflowRow) return null;
+
+  const { results: nodesRows } = await env.DB.prepare(
+    `SELECT id, type, position_x, position_y, config, inputs, outputs FROM nodes WHERE workflow_id = ?`
+  ).bind(id).all();
+
+  const { results: edgesRows } = await env.DB.prepare(
+    `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
+  ).bind(id).all();
+
+  const nodes = nodesRows.map(row => {
+    const nodeObj = {
+      id: row.id,
+      type: row.type,
+      position: { x: row.position_x, y: row.position_y },
+      config: JSON.parse(row.config)
+    };
+    if (row.inputs !== null && row.inputs !== undefined) {
+      nodeObj.inputs = JSON.parse(row.inputs);
+    }
+    if (row.outputs !== null && row.outputs !== undefined) {
+      nodeObj.outputs = JSON.parse(row.outputs);
+    }
+    return nodeObj;
+  });
+
+  const edges = edgesRows.map(row => ({
+    source: row.source,
+    target: row.target,
+    sourceHandle: row.source_handle || 'success'
+  }));
+
+  return {
+    id: workflowRow.id,
+    name: workflowRow.name,
+    created_at: workflowRow.created_at,
+    nodes,
+    edges
+  };
+}
+
+async function handleTelegramEventTriggers(env, update, requestUrl) {
+  const allowList = (env.ALLOWED_CHAT_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const chatId = getChatIdFromUpdate(update);
+  const isAllowed = allowList.length === 0 || (chatId && allowList.includes(String(chatId)));
+  if (!isAllowed) return;
+
+  const matchedEventTypes = getEventType(update);
+  if (matchedEventTypes.length === 0) return;
+
+  const { results: matchedNodes } = await env.DB.prepare(
+    `SELECT DISTINCT workflow_id FROM nodes WHERE type = 'telegram_event_trigger'`
+  ).all();
+
+  for (const row of matchedNodes) {
+    const workflowObj = await getWorkflowObj(env, row.workflow_id);
+    if (!workflowObj) continue;
+
+    const eventNodes = workflowObj.nodes.filter(n => n.type === 'telegram_event_trigger');
+    let triggerData = null;
+    for (const node of eventNodes) {
+      if (node.config && matchedEventTypes.includes(node.config.event_type)) {
+        triggerData = {
+          trigger_type: 'telegram',
+          event_type: node.config.event_type,
+          payload: update
+        };
+        break;
+      }
+    }
+
+    if (triggerData) {
+      const executionId = crypto.randomUUID();
+      await env.DB.prepare(
+        `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+      ).bind(
+        executionId,
+        row.workflow_id,
+        new Date().toISOString()
+      ).run();
+
+      const parsedUrl = new URL(requestUrl);
+      const workerUrl = `${parsedUrl.protocol}//${parsedUrl.host}`;
+
+      await dispatchWorkflow(env, workflowObj, chatId, executionId, workerUrl, triggerData);
+    }
+  }
+}
+
+function getEventType(update) {
+  const types = [];
+  for (const key of Object.keys(update)) {
+    if (key !== 'update_id') {
+      types.push(key);
+    }
+  }
+  if (update.message) {
+    for (const key of Object.keys(update.message)) {
+      if (typeof update.message[key] !== 'undefined') {
+        types.push(key);
+      }
+    }
+  }
+  return types;
+}
+
+function getChatIdFromUpdate(update) {
+  if (update.message?.chat?.id) return update.message.chat.id;
+  if (update.edited_message?.chat?.id) return update.edited_message.chat.id;
+  if (update.channel_post?.chat?.id) return update.channel_post.chat.id;
+  if (update.edited_channel_post?.chat?.id) return update.edited_channel_post.chat.id;
+  if (update.callback_query?.message?.chat?.id) return update.callback_query.message.chat.id;
+  if (update.my_chat_member?.chat?.id) return update.my_chat_member.chat.id;
+  if (update.chat_member?.chat?.id) return update.chat_member.chat.id;
+  if (update.chat_join_request?.chat?.id) return update.chat_join_request.chat.id;
+  return null;
+}
+
+async function handleScheduledTriggers(env, now) {
+  const { results: matchedNodes } = await env.DB.prepare(
+    `SELECT DISTINCT workflow_id FROM nodes WHERE type = 'cron_trigger'`
+  ).all();
+
+  let chatId = null;
+  const allowList = (env.ALLOWED_CHAT_IDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (allowList.length > 0) {
+    chatId = allowList[0];
+  }
+
+  for (const row of matchedNodes) {
+    const workflowObj = await getWorkflowObj(env, row.workflow_id);
+    if (!workflowObj) continue;
+
+    const cronNodes = workflowObj.nodes.filter(n => n.type === 'cron_trigger');
+    let triggerData = null;
+    for (const node of cronNodes) {
+      if (node.config && node.config.cron && cronMatches(node.config.cron, now)) {
+        triggerData = {
+          trigger_type: 'cron',
+          cron: node.config.cron,
+          payload: { scheduled_time: now.toISOString() }
+        };
+        break;
+      }
+    }
+
+    if (triggerData) {
+      const executionId = crypto.randomUUID();
+      await env.DB.prepare(
+        `INSERT INTO executions (id, workflow_id, status, started_at) VALUES (?, ?, 'pending', ?)`
+      ).bind(
+        executionId,
+        row.workflow_id,
+        new Date().toISOString()
+      ).run();
+
+      const workerUrl = env.WORKER_URL || `https://${env.WORKER_NAME || 'telegram-workflow-bot'}.workers.dev`;
+      await dispatchWorkflow(env, workflowObj, chatId, executionId, workerUrl, triggerData);
+    }
+  }
+}
+
+function cronMatches(cronExpression, date) {
+  const parts = cronExpression.trim().split(/\s+/);
+  if (parts.length < 5) return false;
+
+  const [minStr, hourStr, domStr, monthStr, dowStr] = parts;
+
+  const minutes = date.getUTCMinutes();
+  const hours = date.getUTCHours();
+  const dom = date.getUTCDate();
+  const month = date.getUTCMonth() + 1; // 1-12
+  const dow = date.getUTCDay(); // 0-6 (Sunday is 0)
+
+  return (
+    matchField(minStr, minutes, 0, 59) &&
+    matchField(hourStr, hours, 0, 23) &&
+    matchField(domStr, dom, 1, 31) &&
+    matchField(monthStr, month, 1, 12) &&
+    matchField(dowStr, dow, 0, 6)
+  );
+}
+
+function matchField(pattern, val, min, max) {
+  if (pattern === '*') return true;
+
+  if (pattern.includes(',')) {
+    return pattern.split(',').some(p => matchField(p, val, min, max));
+  }
+
+  let rangePattern = pattern;
+  let step = 1;
+  if (pattern.includes('/')) {
+    const parts = pattern.split('/');
+    rangePattern = parts[0] === '' || parts[0] === '*' ? `${min}-${max}` : parts[0];
+    step = parseInt(parts[1], 10);
+    if (isNaN(step)) return false;
+  }
+
+  let start = min;
+  let end = max;
+  if (rangePattern.includes('-')) {
+    const parts = rangePattern.split('-');
+    start = parseInt(parts[0], 10);
+    end = parseInt(parts[1], 10);
+    if (isNaN(start) || isNaN(end)) return false;
+  } else {
+    const single = parseInt(rangePattern, 10);
+    if (!isNaN(single)) {
+      if (step === 1) {
+        return single === val;
+      }
+      start = single;
+      end = max;
+    }
+  }
+
+  if (val < start || val > end) return false;
+  return (val - start) % step === 0;
 }
