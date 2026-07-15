@@ -32,7 +32,7 @@ const workflow = data.payload || data;
 const chatId = data.chat_id;
 const executionId = data.execution_id;
 const workerUrl = data.worker_url;
-const triggerData = data.trigger_data || null;
+const triggerPayload = data.trigger_payload || data.trigger_data || null;
 
 const nodes = Array.isArray(workflow.nodes) ? workflow.nodes : [];
 const edges = Array.isArray(workflow.edges) ? workflow.edges : [];
@@ -86,7 +86,43 @@ function getNestedValue(obj, pathStr) {
   return current;
 }
 
-function interpolate(value, nodeResults) {
+function isSafeUrl(urlString) {
+  try {
+    const parsed = new URL(urlString);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return false;
+    }
+    const hostname = parsed.hostname.toLowerCase();
+    // Block localhost / loopback / standard unsafe addresses
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '0.0.0.0') {
+      return false;
+    }
+    // Block AWS / Cloud metadata Link-local
+    if (hostname === '169.254.169.254') {
+      return false;
+    }
+    // Block private IP ranges
+    if (
+      hostname.startsWith('10.') ||
+      hostname.startsWith('192.168.') ||
+      (hostname.startsWith('172.') && isPrivate172(hostname))
+    ) {
+      return false;
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function isPrivate172(hostname) {
+  const parts = hostname.split('.');
+  if (parts.length < 2) return false;
+  const secondOctet = parseInt(parts[1], 10);
+  return secondOctet >= 16 && secondOctet <= 31;
+}
+
+function interpolate(value, nodeResults, escapeFn = null) {
   if (typeof value === 'string') {
     const singleMatch = value.match(/^\{\{\s*nodes\.([a-zA-Z0-9_-]+)\.outputs\.([a-zA-Z0-9_\.-]+)\s*\}\}$/);
     if (singleMatch) {
@@ -95,7 +131,12 @@ function interpolate(value, nodeResults) {
       const nodeRes = nodeResults[nodeId];
       if (nodeRes && nodeRes.outputs) {
         const val = getNestedValue(nodeRes.outputs, path);
-        if (val !== undefined) return val;
+        if (val !== undefined) {
+          if (escapeFn) {
+            return escapeFn(val, nodeRes.type);
+          }
+          return val;
+        }
       }
       return undefined;
     }
@@ -105,24 +146,28 @@ function interpolate(value, nodeResults) {
       if (nodeRes && nodeRes.outputs) {
         const val = getNestedValue(nodeRes.outputs, path);
         if (val !== undefined) {
-          return typeof val === 'object' ? JSON.stringify(val) : String(val);
+          const rawVal = typeof val === 'object' ? JSON.stringify(val) : String(val);
+          if (escapeFn) {
+            return escapeFn(rawVal, nodeRes.type);
+          }
+          return rawVal;
         }
       }
       return match;
     });
   } else if (Array.isArray(value)) {
-    return value.map(item => interpolate(item, nodeResults));
+    return value.map(item => interpolate(item, nodeResults, escapeFn));
   } else if (value !== null && typeof value === 'object') {
     const res = {};
     for (const k of Object.keys(value)) {
-      res[k] = interpolate(value[k], nodeResults);
+      res[k] = interpolate(value[k], nodeResults, escapeFn);
     }
     return res;
   }
   return value;
 }
 
-async function runNode(node, index, nodeResults, triggerData) {
+async function runNode(node, index, nodeResults, triggerPayload) {
   const entry = { id: node.id, index, type: node.type, started_at: new Date().toISOString() };
 
   if (!ALLOWED_TYPES.has(node.type)) {
@@ -134,7 +179,47 @@ async function runNode(node, index, nodeResults, triggerData) {
 
   // Interpolate inputs and config using outputs from previously executed nodes
   const resolvedInputs = node.inputs ? interpolate(node.inputs, nodeResults) : {};
-  const resolvedConfig = interpolate(node.config || {}, nodeResults);
+  let resolvedConfig;
+
+  if (node.type === 'http') {
+    resolvedConfig = {};
+    const configKeys = Object.keys(node.config || {});
+    for (const key of configKeys) {
+      if (key === 'url') {
+        const isSingleTemplate = /^\{\{\s*nodes\.[a-zA-Z0-9_-]+\.outputs\.[a-zA-Z0-9_\.-]+\s*\}\}$/.test((node.config.url || '').trim());
+        if (isSingleTemplate) {
+          resolvedConfig.url = interpolate(node.config.url, nodeResults);
+        } else {
+          const escapeUrlParam = (val, nodeType) => {
+            const isTrigger = ['webhook_trigger', 'cron_trigger', 'telegram_event_trigger'].includes(nodeType);
+            if (isTrigger) {
+              return encodeURIComponent(String(val));
+            }
+            return val;
+          };
+          resolvedConfig.url = interpolate(node.config.url, nodeResults, escapeUrlParam);
+        }
+
+        // Always check that resolved URL is safe (blocking SSRF loopback/private IPs/unsafe protocols)
+        if (resolvedConfig.url && !isSafeUrl(resolvedConfig.url)) {
+          throw new Error(`SSRF Block: The URL "${resolvedConfig.url}" is unsafe or resolves to a local/private address.`);
+        }
+      } else if (key === 'headers') {
+        const escapeHeaderValue = (val, nodeType) => {
+          const isTrigger = ['webhook_trigger', 'cron_trigger', 'telegram_event_trigger'].includes(nodeType);
+          if (isTrigger) {
+            return String(val).replace(/[\r\n\x00-\x1F\x7F]/g, '');
+          }
+          return val;
+        };
+        resolvedConfig.headers = interpolate(node.config.headers, nodeResults, escapeHeaderValue);
+      } else {
+        resolvedConfig[key] = interpolate(node.config[key], nodeResults);
+      }
+    }
+  } else {
+    resolvedConfig = interpolate(node.config || {}, nodeResults);
+  }
 
   entry.inputs = node.inputs || {};
   entry.resolved_inputs = resolvedInputs;
@@ -195,6 +280,7 @@ async function runNode(node, index, nodeResults, triggerData) {
       entry.outputs = { message: step.message };
       entry.status = 'success';
     } else if (node.type === 'webhook_trigger' || node.type === 'cron_trigger' || node.type === 'telegram_event_trigger') {
+      entry.outputs = triggerPayload || {};
       entry.status = 'success';
     }
   } catch (err) {
@@ -259,7 +345,7 @@ async function runNode(node, index, nodeResults, triggerData) {
 
     let entry;
     try {
-      entry = await runNode(node, index++, nodeResults, triggerData);
+      entry = await runNode(node, index++, nodeResults, triggerPayload);
       log.steps.push(entry);
       nodeResults[currentId] = entry;
       executed.add(currentId);
