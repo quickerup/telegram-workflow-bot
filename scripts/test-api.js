@@ -339,8 +339,8 @@ ALLOWED_CHAT_IDS=12345
       throw new Error(`Expected execute full graph to attempt Actions dispatch and fail on PAT, but got status ${resExecuteFull.statusCode} with body: ${JSON.stringify(resExecuteFull.body)}`);
     }
 
-    // 9. Test Webhook trigger: POST workflow with webhook_trigger, then trigger via webhook
-    console.log('Test 9: Webhook trigger test...');
+    // 9. Test Webhook trigger: POST workflow with webhook_trigger containing a secret, then trigger via webhook with correct header
+    console.log('Test 9: Webhook trigger test with configured secret...');
     const webhookWorkflow = {
       name: "Webhook Test Workflow",
       nodes: [
@@ -348,7 +348,9 @@ ALLOWED_CHAT_IDS=12345
           id: "node_webhook",
           type: "webhook_trigger",
           position: { x: 100, y: 150 },
-          config: {}
+          config: {
+            secret: "my-webhook-secret"
+          }
         },
         {
           id: "node_notify",
@@ -384,8 +386,47 @@ ALLOWED_CHAT_IDS=12345
     const webhookWfId = resSaveWebhook.body.workflow.id;
     console.log(`Saved webhook workflow with ID: ${webhookWfId}`);
 
-    // POST to /webhooks/:id
+    // POST to /webhooks/:id with valid X-Workflow-Secret
     const resTriggerWebhook = await request({
+      hostname: 'localhost',
+      port: 8787,
+      path: `/webhooks/${webhookWfId}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Workflow-Secret': 'my-webhook-secret'
+      }
+    }, { test: "payload", chat_id: 99999 }); // Supplying a chat_id to test trust removal
+
+    if (resTriggerWebhook.statusCode === 500 && resTriggerWebhook.body.error && resTriggerWebhook.body.error.includes('GitHub dispatch failed')) {
+      console.log('Test 9 passed (attempted GitHub dispatch as expected)!');
+    } else if (resTriggerWebhook.statusCode === 200 && resTriggerWebhook.body.ok) {
+      console.log('Test 9 passed (webhook dispatch succeeded)!');
+    } else {
+      throw new Error(`Expected webhook trigger to attempt Actions dispatch, but got status ${resTriggerWebhook.statusCode} with body: ${JSON.stringify(resTriggerWebhook.body)}`);
+    }
+
+    // 9a. Test Webhook trigger: request with invalid secret is rejected (401)
+    console.log('Test 9a: Webhook trigger with invalid secret...');
+    const resTriggerWebhookInvalid = await request({
+      hostname: 'localhost',
+      port: 8787,
+      path: `/webhooks/${webhookWfId}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Workflow-Secret': 'wrong-secret'
+      }
+    }, { test: "payload" });
+
+    if (resTriggerWebhookInvalid.statusCode !== 401) {
+      throw new Error(`Expected 401 for invalid secret, got ${resTriggerWebhookInvalid.statusCode}`);
+    }
+    console.log('Test 9a passed!');
+
+    // 9b. Test Webhook trigger: request with missing secret is rejected (401)
+    console.log('Test 9b: Webhook trigger with missing secret header...');
+    const resTriggerWebhookMissing = await request({
       hostname: 'localhost',
       port: 8787,
       path: `/webhooks/${webhookWfId}`,
@@ -395,13 +436,81 @@ ALLOWED_CHAT_IDS=12345
       }
     }, { test: "payload" });
 
-    if (resTriggerWebhook.statusCode === 500 && resTriggerWebhook.body.error && resTriggerWebhook.body.error.includes('GitHub dispatch failed')) {
-      console.log('Test 9 passed (attempted GitHub dispatch as expected)!');
-    } else if (resTriggerWebhook.statusCode === 200 && resTriggerWebhook.body.ok) {
-      console.log('Test 9 passed (webhook dispatch succeeded)!');
-    } else {
-      throw new Error(`Expected webhook trigger to attempt Actions dispatch, but got status ${resTriggerWebhook.statusCode} with body: ${JSON.stringify(resTriggerWebhook.body)}`);
+    if (resTriggerWebhookMissing.statusCode !== 401) {
+      throw new Error(`Expected 401 for missing secret, got ${resTriggerWebhookMissing.statusCode}`);
     }
+    console.log('Test 9b passed!');
+
+    // 9c. Test Webhook trigger: workflow with no configured secret is rejected entirely (403)
+    console.log('Test 9c: Webhook trigger with no secret configured on node...');
+    const noSecretWorkflow = {
+      name: "No Secret Webhook Workflow",
+      nodes: [
+        {
+          id: "node_webhook",
+          type: "webhook_trigger",
+          position: { x: 100, y: 150 },
+          config: {} // No secret config
+        }
+      ],
+      edges: []
+    };
+
+    const resSaveNoSecret = await request({
+      hostname: 'localhost',
+      port: 8787,
+      path: '/api/workflows',
+      method: 'POST',
+      headers: {
+        'Cf-Access-Authenticated-User-Email': 'user@example.com',
+        'Content-Type': 'application/json'
+      }
+    }, noSecretWorkflow);
+
+    const noSecretWfId = resSaveNoSecret.body.workflow.id;
+
+    const resTriggerNoSecret = await request({
+      hostname: 'localhost',
+      port: 8787,
+      path: `/webhooks/${noSecretWfId}`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Workflow-Secret': 'some-secret'
+      }
+    });
+
+    if (resTriggerNoSecret.statusCode !== 403) {
+      throw new Error(`Expected 403 for unconfigured secret on node, got ${resTriggerNoSecret.statusCode}`);
+    }
+    console.log('Test 9c passed!');
+
+    // 9d. Test Webhook trigger: Rate limiting blocks high frequency spam (429)
+    console.log('Test 9d: Webhook trigger rate limiting...');
+    // We already fired 1 valid request for `webhookWfId` in Test 9. Let's fire 5 more to exceed the 5 reqs/60s limit.
+    let hitRateLimit = false;
+    for (let i = 0; i < 6; i++) {
+      const resSpam = await request({
+        hostname: 'localhost',
+        port: 8787,
+        path: `/webhooks/${webhookWfId}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Workflow-Secret': 'my-webhook-secret'
+        }
+      }, { test: "payload" });
+
+      if (resSpam.statusCode === 429) {
+        hitRateLimit = true;
+        break;
+      }
+    }
+
+    if (!hitRateLimit) {
+      throw new Error('Expected to hit 429 Too Many Requests during rate limiting test, but did not');
+    }
+    console.log('Test 9d passed!');
 
     // 10. Test Telegram Event trigger: POST workflow with telegram_event_trigger (edited_message), then POST Telegram update to /
     console.log('Test 10: Telegram event trigger test...');

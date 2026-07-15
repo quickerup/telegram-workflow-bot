@@ -1,6 +1,7 @@
 name = "telegram-workflow-bot"
 main = "src/index.js"
 compatibility_date = "2026-07-01"
+compatibility_flags = [ "nodejs_compat" ]
 
 [vars]
 GITHUB_OWNER = "quickerup"

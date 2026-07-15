@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+
 const ALLOWED_STEP_TYPES = new Set(['run', 'http', 'delay', 'notify', 'webhook_trigger', 'cron_trigger', 'telegram_event_trigger']);
 const MAX_NODES = 50;
 const MAX_FILE_SIZE_BYTES = 200_000; // 200 KB — plenty for a workflow definition
@@ -42,6 +44,73 @@ export default {
             });
           }
 
+          const clientSecret = request.headers.get('X-Workflow-Secret');
+
+          const safeCompare = (a, b) => {
+            if (typeof a !== 'string' || typeof b !== 'string') return false;
+            const aBuf = new TextEncoder().encode(a);
+            const bBuf = new TextEncoder().encode(b);
+            if (aBuf.byteLength !== bBuf.byteLength) return false;
+            return crypto.timingSafeEqual(aBuf, bBuf);
+          };
+
+          let hasConfiguredSecret = false;
+          let isAuthorized = false;
+
+          for (const row of nodesRows) {
+            if (row.type === 'webhook_trigger') {
+              const config = JSON.parse(row.config || '{}');
+              if (config && typeof config.secret === 'string' && config.secret.trim() !== '') {
+                hasConfiguredSecret = true;
+                if (clientSecret && safeCompare(clientSecret, config.secret)) {
+                  isAuthorized = true;
+                }
+              }
+            }
+          }
+
+          if (!hasConfiguredSecret) {
+            return new Response(JSON.stringify({ ok: false, error: 'Unauthorized: Webhook trigger has no configured secret' }), {
+              status: 403,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          if (!isAuthorized) {
+            return new Response(JSON.stringify({ ok: false, error: 'Unauthorized: Invalid X-Workflow-Secret' }), {
+              status: 401,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+
+          // Rate Limiting using WORKFLOW_STATE KV per workflow ID (limit to 5 requests per 60s)
+          if (env.WORKFLOW_STATE) {
+            const limitKey = `ratelimit:${id}`;
+            const limitInfoRaw = await env.WORKFLOW_STATE.get(limitKey);
+            let limitInfo = { count: 0, reset: Date.now() + 60000 };
+            if (limitInfoRaw) {
+              try {
+                limitInfo = JSON.parse(limitInfoRaw);
+              } catch (e) {}
+            }
+
+            if (Date.now() > limitInfo.reset) {
+              limitInfo.count = 0;
+              limitInfo.reset = Date.now() + 60000;
+            }
+
+            const RATE_LIMIT_THRESHOLD = 5;
+            if (limitInfo.count >= RATE_LIMIT_THRESHOLD) {
+              return new Response(JSON.stringify({ ok: false, error: 'Too Many Requests: Rate limit exceeded.' }), {
+                status: 429,
+                headers: { 'Content-Type': 'application/json' },
+              });
+            }
+
+            limitInfo.count++;
+            await env.WORKFLOW_STATE.put(limitKey, JSON.stringify(limitInfo), { expirationTtl: 60 });
+          }
+
           const { results: edgesRows } = await env.DB.prepare(
             `SELECT source, target, source_handle FROM edges WHERE workflow_id = ?`
           ).bind(id).all();
@@ -76,25 +145,20 @@ export default {
             new Date().toISOString()
           ).run();
 
-          // Get chat ID from optional body or default to ALLOWED_CHAT_IDS
-          let chatId = null;
+          // Force all notify dispatches to resolve the chat_id exclusively from server-side stored owner data
           let triggerPayload = null;
           try {
             triggerPayload = await request.json().catch(() => null);
-            if (triggerPayload && triggerPayload.chat_id) {
-              chatId = triggerPayload.chat_id;
+            if (triggerPayload && typeof triggerPayload === 'object') {
+              delete triggerPayload.chat_id;
             }
           } catch (e) {}
 
-          if (!chatId) {
-            const allowList = (env.ALLOWED_CHAT_IDS || '')
-              .split(',')
-              .map((s) => s.trim())
-              .filter(Boolean);
-            if (allowList.length > 0) {
-              chatId = allowList[0];
-            }
-          }
+          const allowList = (env.ALLOWED_CHAT_IDS || '')
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean);
+          const chatId = allowList[0] || null;
 
           const workerUrl = `${url.protocol}//${url.host}`;
           await dispatchWorkflow(env, workflowObj, chatId, executionId, workerUrl, triggerPayload);
