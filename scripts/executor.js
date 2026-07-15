@@ -217,6 +217,24 @@ async function runNode(node, index, nodeResults, triggerPayload) {
         resolvedConfig[key] = interpolate(node.config[key], nodeResults);
       }
     }
+  } else if (node.type === 'run') {
+    resolvedConfig = {};
+    const configKeys = Object.keys(node.config || {});
+    for (const key of configKeys) {
+      if (key === 'command') {
+        const shellEscape = (val, nodeType) => {
+          const isTrigger = ['webhook_trigger', 'cron_trigger', 'telegram_event_trigger'].includes(nodeType);
+          if (isTrigger) {
+            // Safely wrap the string in single quotes, escaping any single quotes inside.
+            return "'" + String(val).replace(/'/g, "'\\''") + "'";
+          }
+          return val;
+        };
+        resolvedConfig.command = interpolate(node.config.command, nodeResults, shellEscape);
+      } else {
+        resolvedConfig[key] = interpolate(node.config[key], nodeResults);
+      }
+    }
   } else {
     resolvedConfig = interpolate(node.config || {}, nodeResults);
   }
