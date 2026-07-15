@@ -28,15 +28,7 @@
           },
           "type": {
             "type": "string",
-            "enum": [
-              "run",
-              "http",
-              "delay",
-              "notify",
-              "webhook_trigger",
-              "cron_trigger",
-              "telegram_event_trigger"
-            ]
+            "enum": ["run", "http", "delay", "notify", "webhook_trigger", "cron_trigger", "telegram_event_trigger"]
           },
           "position": {
             "type": "object",
@@ -138,7 +130,7 @@
                   "type": "object",
                   "additionalProperties": false,
                   "properties": {
-                    "secret": { "type": "string" }
+                    "continue_on_error": { "type": "boolean" }
                   }
                 }
               }
@@ -153,7 +145,8 @@
                   "required": ["cron"],
                   "additionalProperties": false,
                   "properties": {
-                    "cron": { "type": "string" }
+                    "cron": { "type": "string" },
+                    "continue_on_error": { "type": "boolean" }
                   }
                 }
               }
@@ -168,7 +161,16 @@
                   "required": ["event_type"],
                   "additionalProperties": false,
                   "properties": {
-                    "event_type": { "type": "string" }
+                    "event_type": {
+                      "oneOf": [
+                        { "type": "string" },
+                        {
+                          "type": "array",
+                          "items": { "type": "string" }
+                        }
+                      ]
+                    },
+                    "continue_on_error": { "type": "boolean" }
                   }
                 }
               }

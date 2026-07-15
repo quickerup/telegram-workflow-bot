@@ -15,12 +15,12 @@ ALLOWED_CHAT_IDS = "8492548344"
 # WORKFLOW_STATE` (deploy.sh does this for you) and paste the id below.
 [[kv_namespaces]]
 binding = "WORKFLOW_STATE"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "3dd81cec970c49d194a54509b0c768a1"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "telegram-workflow-bot-db"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "6185c6fc-b318-4846-a1d1-1ebde50569c0"
 
 # Secrets — set these with `wrangler secret put <NAME>`, never write real values here:
 #   TELEGRAM_BOT_TOKEN      (from @BotFather)

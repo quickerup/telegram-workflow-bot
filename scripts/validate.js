@@ -4,15 +4,7 @@
 
 const fs = require('fs');
 
-const ALLOWED_TYPES = new Set([
-  'run',
-  'http',
-  'delay',
-  'notify',
-  'webhook_trigger',
-  'cron_trigger',
-  'telegram_event_trigger'
-]);
+const ALLOWED_TYPES = new Set(['run', 'http', 'delay', 'notify', 'webhook_trigger', 'cron_trigger', 'telegram_event_trigger']);
 const MAX_NODES = 50;
 
 const file = process.argv[2];
@@ -95,16 +87,13 @@ if (!Array.isArray(workflow.nodes)) {
     if (node.type === 'notify' && typeof config.message !== 'string') {
       errors.push(`node ${i} (${node.id || 'unnamed'}): "notify" config needs a string "message"`);
     }
-    if (node.type === 'webhook_trigger') {
-      if (config.secret !== undefined && typeof config.secret !== 'string') {
-        errors.push(`node ${i} (${node.id || 'unnamed'}): "webhook_trigger" config "secret" must be a string`);
-      }
-    }
     if (node.type === 'cron_trigger' && typeof config.cron !== 'string') {
       errors.push(`node ${i} (${node.id || 'unnamed'}): "cron_trigger" config needs a string "cron"`);
     }
-    if (node.type === 'telegram_event_trigger' && typeof config.event_type !== 'string') {
-      errors.push(`node ${i} (${node.id || 'unnamed'}): "telegram_event_trigger" config needs a string "event_type"`);
+    if (node.type === 'telegram_event_trigger') {
+      if (typeof config.event_type !== 'string' && !Array.isArray(config.event_type)) {
+        errors.push(`node ${i} (${node.id || 'unnamed'}): "telegram_event_trigger" config needs a string or array "event_type"`);
+      }
     }
   });
 
