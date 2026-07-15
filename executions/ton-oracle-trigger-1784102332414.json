@@ -1,0 +1,103 @@
+{
+  "name": "ton-oracle-trigger",
+  "started_at": "2026-07-15T07:58:52.026Z",
+  "steps": [
+    {
+      "id": "trigger_1",
+      "index": 0,
+      "type": "webhook_trigger",
+      "started_at": "2026-07-15T07:58:52.027Z",
+      "inputs": {},
+      "resolved_inputs": {},
+      "resolved_config": {},
+      "outputs": {},
+      "status": "success",
+      "finished_at": "2026-07-15T07:58:52.027Z"
+    },
+    {
+      "id": "fetch_ton_price",
+      "index": 1,
+      "type": "http",
+      "started_at": "2026-07-15T07:58:52.027Z",
+      "inputs": {},
+      "resolved_inputs": {},
+      "resolved_config": {
+        "continue_on_error": false,
+        "method": "GET",
+        "url": "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd"
+      },
+      "http_status": 200,
+      "response": "{\"the-open-network\":{\"usd\":1.61}}",
+      "outputs": {
+        "response": {
+          "the-open-network": {
+            "usd": 1.61
+          }
+        },
+        "status": 200
+      },
+      "status": "success",
+      "finished_at": "2026-07-15T07:58:52.139Z"
+    },
+    {
+      "id": "fetch_wallet_balance",
+      "index": 2,
+      "type": "http",
+      "started_at": "2026-07-15T07:58:52.140Z",
+      "inputs": {},
+      "resolved_inputs": {},
+      "resolved_config": {
+        "continue_on_error": true,
+        "method": "GET",
+        "url": "https://toncenter.com/api/v2/getAddressBalance?address=YOUR_TON_WALLET_ADDRESS_HERE"
+      },
+      "http_status": 422,
+      "response": "{\"ok\":false,\"error\":\"failed to parse get request: Failed to parse ton_addr: 'YOUR_TON_WALLET_ADDRESS_HERE'\",\"code\":422,\"@extra\":\"1784102332:_:0.028\"}",
+      "outputs": {
+        "response": {
+          "ok": false,
+          "error": "failed to parse get request: Failed to parse ton_addr: 'YOUR_TON_WALLET_ADDRESS_HERE'",
+          "code": 422,
+          "@extra": "1784102332:_:0.028"
+        },
+        "status": 422
+      },
+      "status": "failed_ignored",
+      "error": "HTTP 422",
+      "finished_at": "2026-07-15T07:58:52.413Z"
+    },
+    {
+      "id": "notify_success",
+      "index": 3,
+      "type": "notify",
+      "started_at": "2026-07-15T07:58:52.413Z",
+      "inputs": {
+        "price_data": "{{ nodes.fetch_ton_price.outputs.response }}",
+        "wallet_data": "{{ nodes.fetch_wallet_balance.outputs.response }}"
+      },
+      "resolved_inputs": {
+        "price_data": {
+          "the-open-network": {
+            "usd": 1.61
+          }
+        },
+        "wallet_data": {
+          "ok": false,
+          "error": "failed to parse get request: Failed to parse ton_addr: 'YOUR_TON_WALLET_ADDRESS_HERE'",
+          "code": 422,
+          "@extra": "1784102332:_:0.028"
+        }
+      },
+      "resolved_config": {
+        "message": "📊 **TON Oracle Update**\n\n💎 Current TON Price: $1.61\n💼 Wallet Balance (nanotons): {{ nodes.fetch_wallet_balance.outputs.response.result }}\n\n*Triggered via Sovereign Orchestrator*"
+      },
+      "outputs": {
+        "message": "📊 **TON Oracle Update**\n\n💎 Current TON Price: $1.61\n💼 Wallet Balance (nanotons): {{ nodes.fetch_wallet_balance.outputs.response.result }}\n\n*Triggered via Sovereign Orchestrator*"
+      },
+      "status": "success",
+      "finished_at": "2026-07-15T07:58:52.413Z"
+    }
+  ],
+  "status": "partial_failure",
+  "finished_at": "2026-07-15T07:58:52.413Z"
+}
