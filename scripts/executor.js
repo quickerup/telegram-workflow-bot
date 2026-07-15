@@ -328,6 +328,8 @@ async function runNode(node, index, nodeResults, triggerPayload) {
     }
   });
 
+  const startNodeId = data.start_node_id || (data.payload && data.payload.start_node_id) || null;
+
   // Find start nodes (nodes with no incoming edges)
   const incomingCount = {};
   nodes.forEach(n => { incomingCount[n.id] = 0; });
@@ -339,9 +341,11 @@ async function runNode(node, index, nodeResults, triggerPayload) {
 
   const startNodes = nodes.filter(n => incomingCount[n.id] === 0);
 
-  // If there's no node with 0 incoming count but we have nodes, default to the first node
+  // If startNodeId is provided and valid, start ONLY from that node
   let queue = [];
-  if (startNodes.length > 0) {
+  if (startNodeId && nodeMap[startNodeId]) {
+    queue = [startNodeId];
+  } else if (startNodes.length > 0) {
     queue = startNodes.map(n => n.id);
   } else if (nodes.length > 0) {
     queue = [nodes[0].id];
