@@ -1,5 +1,6 @@
 const { spawn } = require('child_process');
 const http = require('http');
+const fs = require('fs');
 
 async function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -39,10 +40,35 @@ async function request(options, body = null, timeoutMs = 5000) {
 }
 
 (async () => {
+  console.log('Writing temporary worker/.dev.vars...');
+  fs.writeFileSync('worker/.dev.vars', `
+TELEGRAM_BOT_TOKEN=123456:fake-token
+TELEGRAM_WEBHOOK_SECRET=secret
+GITHUB_PAT=github_pat_fake
+ALLOWED_CHAT_IDS=12345
+  `.trim());
+
+  console.log('Initializing local test D1 database schema...');
+  try {
+    require('child_process').execFileSync(
+      'npx',
+      ['wrangler', 'd1', 'execute', 'telegram-workflow-bot-db', '--local', '--file=./schema.sql'],
+      { cwd: 'worker', stdio: 'inherit' }
+    );
+  } catch (e) {
+    console.error('Failed to apply local D1 schema:', e.message);
+    process.exit(1);
+  }
+
   console.log('Starting wrangler dev server for builder test on port 8790...');
   const devServer = spawn('npx', ['wrangler', 'dev', '--port', '8790'], {
-    cwd: 'worker'
+    cwd: 'worker',
+    detached: true
   });
+
+  const killDevServer = () => {
+    try { process.kill(-devServer.pid, 'SIGKILL'); } catch (e) { try { devServer.kill('SIGKILL'); } catch (e2) {} }
+  };
 
   // Wait for wrangler dev to be ready with a timeout
   let ready = false;
@@ -73,7 +99,7 @@ async function request(options, body = null, timeoutMs = 5000) {
 
   if (!ready) {
     console.error('Wrangler dev failed to start on port 8790.');
-    devServer.kill();
+    killDevServer();
     process.exit(1);
   }
 
@@ -305,11 +331,13 @@ async function request(options, body = null, timeoutMs = 5000) {
     console.log('Test 11 passed: Conversational Workflow successfully validated and persisted in database!');
 
     console.log('\nAll advanced conversational builder tests passed successfully!');
-    devServer.kill();
+    try { fs.unlinkSync('worker/.dev.vars'); } catch (e) {}
+    killDevServer();
     process.exit(0);
   } catch (err) {
     console.error('\nInteractive builder test suite failed:', err);
-    devServer.kill();
+    try { fs.unlinkSync('worker/.dev.vars'); } catch (e) {}
+    killDevServer();
     process.exit(1);
   }
 })();

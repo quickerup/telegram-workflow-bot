@@ -719,9 +719,10 @@ export default {
     }
 
     const message = update.message;
-    if (!message) return new Response('OK');
+    const callbackQuery = update.callback_query;
+    if (!message && !callbackQuery) return new Response('OK');
 
-    const chatId = message.chat.id;
+    const chatId = message ? message.chat.id : callbackQuery.message.chat.id;
 
     // --- Authorization: only allowlisted chat IDs may trigger workflows ---
     const allowList = (env.ALLOWED_CHAT_IDS || '')
@@ -1173,6 +1174,293 @@ async function handleCancel(env, chatId) {
   await env.WORKFLOW_STATE.delete(`pending:${chatId}`);
   await env.WORKFLOW_STATE.delete(`builder:${chatId}`);
   await sendMessage(env, chatId, 'Discarded.');
+}
+
+async function getBuilderState(env, chatId) {
+  const data = await env.WORKFLOW_STATE.get(`builder:${chatId}`);
+  return data ? JSON.parse(data) : null;
+}
+
+async function setBuilderState(env, chatId, state) {
+  await env.WORKFLOW_STATE.put(`builder:${chatId}`, JSON.stringify(state));
+}
+
+async function clearBuilderState(env, chatId) {
+  await env.WORKFLOW_STATE.delete(`builder:${chatId}`);
+}
+
+async function handleNewWorkflow(env, chatId, text) {
+  const parts = text.trim().split(/\s+/);
+  let name = parts.slice(1).join(' ').trim();
+
+  if (name) {
+    const state = {
+      state: 'AWAITING_NODE_TYPE',
+      workflow: {
+        name,
+        nodes: [],
+        edges: []
+      }
+    };
+    await setBuilderState(env, chatId, state);
+    await promptNodeType(env, chatId, state);
+  } else {
+    const state = {
+      state: 'AWAITING_NAME',
+      workflow: {
+        name: '',
+        nodes: [],
+        edges: []
+      }
+    };
+    await setBuilderState(env, chatId, state);
+    await sendMessage(env, chatId, "Let's build a new workflow! What should we name it?\n(Or send /cancel to abort)");
+  }
+}
+
+async function promptNodeType(env, chatId, state) {
+  const inlineKeyboard = {
+    inline_keyboard: [
+      [
+        { text: 'Run Command (run)', callback_data: 'type:run' },
+        { text: 'HTTP Request (http)', callback_data: 'type:http' }
+      ],
+      [
+        { text: 'Delay (delay)', callback_data: 'type:delay' },
+        { text: 'Telegram Notify (notify)', callback_data: 'type:notify' }
+      ],
+      [
+        { text: '❌ Cancel Builder', callback_data: 'builder:cancel' }
+      ]
+    ]
+  };
+  await sendMessage(env, chatId, `Select the type for node #${state.workflow.nodes.length + 1}:`, inlineKeyboard);
+}
+
+async function handleBuilderCallback(env, chatId, callbackQuery) {
+  const data = callbackQuery.data;
+  let state = await getBuilderState(env, chatId);
+  if (!state) {
+    await sendMessage(env, chatId, "No active workflow builder session. Send /newworkflow to start.");
+    return;
+  }
+
+  if (data === 'builder:cancel') {
+    await clearBuilderState(env, chatId);
+    await sendMessage(env, chatId, "Workflow builder canceled.");
+    return;
+  }
+
+  // Reject action buttons if they are clicked out-of-order/stale while in the middle of configuring a node
+  if ((data === 'builder:add_node' || data === 'builder:finish') && state.state !== 'AWAITING_NEXT_ACTION') {
+    await sendMessage(env, chatId, "⚠️ Please finish configuring the current node first or cancel the builder with /cancel.");
+    return;
+  }
+
+  if (data === 'builder:add_node') {
+    state.state = 'AWAITING_NODE_TYPE';
+    await setBuilderState(env, chatId, state);
+    await promptNodeType(env, chatId, state);
+    return;
+  }
+
+  if (data === 'builder:finish') {
+    await finalizeAndStageWorkflow(env, chatId, state);
+    return;
+  }
+
+  if (state.state === 'AWAITING_NODE_TYPE' && data.startsWith('type:')) {
+    const nodeType = data.substring(5);
+    state.currentNode = {
+      id: `node_${state.workflow.nodes.length + 1}`,
+      type: nodeType,
+      config: {}
+    };
+
+    if (nodeType === 'run') {
+      state.state = 'AWAITING_RUN_COMMAND';
+      await setBuilderState(env, chatId, state);
+      await sendMessage(env, chatId, `Node [${state.currentNode.id}]: Enter the shell command to execute:`);
+    } else if (nodeType === 'http') {
+      state.state = 'AWAITING_HTTP_URL';
+      await setBuilderState(env, chatId, state);
+      await sendMessage(env, chatId, `Node [${state.currentNode.id}]: Enter the target HTTP URL:`);
+    } else if (nodeType === 'delay') {
+      state.state = 'AWAITING_DELAY_MS';
+      await setBuilderState(env, chatId, state);
+      await sendMessage(env, chatId, `Node [${state.currentNode.id}]: Enter the delay in milliseconds (e.g. 5000):`);
+    } else if (nodeType === 'notify') {
+      state.state = 'AWAITING_NOTIFY_MESSAGE';
+      await setBuilderState(env, chatId, state);
+      await sendMessage(env, chatId, `Node [${state.currentNode.id}]: Enter the message to notify/send to Telegram:`);
+    }
+    return;
+  }
+
+  if (state.state === 'AWAITING_HTTP_METHOD' && data.startsWith('method:')) {
+    const method = data.substring(7);
+    state.currentNode.config.method = method;
+    await commitCurrentNode(env, chatId, state);
+  }
+}
+
+async function handleBuilderState(env, chatId, text) {
+  const state = await getBuilderState(env, chatId);
+  if (!state) return false;
+
+  if (typeof text !== 'string' || !text) {
+    await sendMessage(env, chatId, "⚠️ Unexpected message type. Please enter text configuration or /cancel.");
+    return true; // We handled/consumed it so it doesn't trigger the default help text
+  }
+
+  if (state.state === 'AWAITING_NAME') {
+    const name = text.trim();
+    if (!name) {
+      await sendMessage(env, chatId, "Name cannot be empty. Please enter a workflow name:");
+      return true;
+    }
+    state.workflow.name = name;
+    state.state = 'AWAITING_NODE_TYPE';
+    await setBuilderState(env, chatId, state);
+    await promptNodeType(env, chatId, state);
+    return true;
+  }
+
+  if (state.state === 'AWAITING_RUN_COMMAND') {
+    const command = text.trim();
+    if (!command) {
+      await sendMessage(env, chatId, "Command cannot be empty. Please enter a shell command:");
+      return true;
+    }
+    state.currentNode.config.command = command;
+    await commitCurrentNode(env, chatId, state);
+    return true;
+  }
+
+  if (state.state === 'AWAITING_HTTP_URL') {
+    const url = text.trim();
+    if (!url) {
+      await sendMessage(env, chatId, "URL cannot be empty. Please enter an HTTP URL:");
+      return true;
+    }
+    state.currentNode.config.url = url;
+    state.state = 'AWAITING_HTTP_METHOD';
+    await setBuilderState(env, chatId, state);
+
+    const inlineKeyboard = {
+      inline_keyboard: [
+        [
+          { text: 'GET', callback_data: 'method:GET' },
+          { text: 'POST', callback_data: 'method:POST' }
+        ],
+        [
+          { text: 'PUT', callback_data: 'method:PUT' },
+          { text: 'DELETE', callback_data: 'method:DELETE' }
+        ]
+      ]
+    };
+    await sendMessage(env, chatId, `Node [${state.currentNode.id}]: Select the HTTP Method:`, inlineKeyboard);
+    return true;
+  }
+
+  if (state.state === 'AWAITING_DELAY_MS') {
+    const ms = parseInt(text.trim(), 10);
+    if (isNaN(ms) || ms < 0) {
+      await sendMessage(env, chatId, "Please enter a valid non-negative number for milliseconds delay:");
+      return true;
+    }
+    state.currentNode.config.ms = ms;
+    await commitCurrentNode(env, chatId, state);
+    return true;
+  }
+
+  if (state.state === 'AWAITING_NOTIFY_MESSAGE') {
+    const message = text.trim();
+    if (!message) {
+      await sendMessage(env, chatId, "Message cannot be empty. Please enter a notification message:");
+      return true;
+    }
+    state.currentNode.config.message = message;
+    await commitCurrentNode(env, chatId, state);
+    return true;
+  }
+
+  return false;
+}
+
+async function commitCurrentNode(env, chatId, state) {
+  const node = state.currentNode;
+  node.position = {
+    x: 100,
+    y: 100 + state.workflow.nodes.length * 150
+  };
+
+  const previousNode = state.workflow.nodes[state.workflow.nodes.length - 1];
+  state.workflow.nodes.push(node);
+
+  if (previousNode) {
+    state.workflow.edges.push({
+      source: previousNode.id,
+      target: node.id,
+      sourceHandle: 'success'
+    });
+  }
+
+  delete state.currentNode;
+  state.state = 'AWAITING_NEXT_ACTION';
+  await setBuilderState(env, chatId, state);
+
+  let currentSummary = `Successfully added Node [${node.id}] (${node.type}).\n\nCurrent Workflow structure:\n`;
+  state.workflow.nodes.forEach((n) => {
+    currentSummary += `- [${n.id}] ${n.type}\n`;
+  });
+
+  const inlineKeyboard = {
+    inline_keyboard: [
+      [
+        { text: '➕ Add Next Node', callback_data: 'builder:add_node' },
+        { text: '💾 Save & Finish', callback_data: 'builder:finish' }
+      ],
+      [
+        { text: '❌ Cancel Builder', callback_data: 'builder:cancel' }
+      ]
+    ]
+  };
+
+  await sendMessage(env, chatId, currentSummary + `\nWhat would you like to do next?`, inlineKeyboard);
+}
+
+async function finalizeAndStageWorkflow(env, chatId, state) {
+  const workflow = state.workflow;
+  if (!workflow.nodes || workflow.nodes.length === 0) {
+    await sendMessage(env, chatId, "Cannot finalize workflow with no nodes. Add at least one node or /cancel.");
+    return;
+  }
+
+  const errors = validateWorkflow(workflow);
+  if (errors.length > 0) {
+    await sendMessage(env, chatId, `Workflow validation failed:\n- ${errors.join('\n- ')}\n\nCancel builder with /cancel.`);
+    return;
+  }
+
+  // Stage workflow and require explicit /confirm
+  const token = crypto.randomUUID().slice(0, 8);
+  const pendingKey = `pending:${chatId}`;
+  await env.WORKFLOW_STATE.put(
+    pendingKey,
+    JSON.stringify({ workflow, token, created_at: Date.now() }),
+    { expirationTtl: CONFIRM_TTL_SECONDS }
+  );
+
+  const summary = summarizeWorkflow(workflow);
+  await sendMessage(
+    env, chatId,
+    `Workflow builder finished! Staged "${workflow.name}" (${workflow.nodes.length} node(s)):\n\n${summary}\n\n` +
+    `Reply "/confirm ${token}" within ${CONFIRM_TTL_SECONDS / 60} minutes to run it, or /cancel to discard.`
+  );
+
+  // Clear builder state only after the staging and confirmation message is successful
+  await clearBuilderState(env, chatId);
 }
 
 async function dispatchWorkflow(env, workflow, chatId, executionId, workerUrl, triggerPayload = null) {

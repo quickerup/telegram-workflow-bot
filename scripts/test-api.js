@@ -1,4 +1,4 @@
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const http = require('http');
 const fs = require('fs');
 
@@ -35,7 +35,16 @@ async function request(options, body = null) {
 
 (async () => {
   console.log('Initializing local test D1 database schema...');
-  // Ensure we've run d1 execute locally first, though we did it in bash, let's make sure it's done.
+  try {
+    execFileSync(
+      'npx',
+      ['wrangler', 'd1', 'execute', 'telegram-workflow-bot-db', '--local', '--file=./schema.sql'],
+      { cwd: 'worker', stdio: 'inherit' }
+    );
+  } catch (e) {
+    console.error('Failed to apply local D1 schema:', e.message);
+    process.exit(1);
+  }
 
   console.log('Writing temporary worker/.dev.vars...');
   fs.writeFileSync('worker/.dev.vars', `
@@ -46,7 +55,12 @@ ALLOWED_CHAT_IDS=12345
   `.trim());
 
   console.log('Starting wrangler dev server...');
+  const killDevServer = () => {
+    try { process.kill(-devServer.pid, 'SIGKILL'); } catch (e) { try { devServer.kill('SIGKILL'); } catch (e2) {} }
+  };
+
   const devServer = spawn('npx', ['wrangler', 'dev', '--port', '8787'], {
+    detached: true,
     cwd: 'worker',
     env: {
       ...process.env,
@@ -84,7 +98,7 @@ ALLOWED_CHAT_IDS=12345
 
   if (!ready) {
     console.error('Wrangler dev failed to start on port 8787.');
-    devServer.kill();
+    killDevServer();
     process.exit(1);
   }
 
@@ -511,13 +525,13 @@ ALLOWED_CHAT_IDS=12345
 
     console.log('\nAll integration tests passed successfully!');
     try { fs.unlinkSync('worker/.dev.vars'); } catch (e) {}
-    devServer.kill();
+    killDevServer();
     process.exit(0);
 
   } catch (err) {
     console.error('\nTest suite failed:', err);
     try { fs.unlinkSync('worker/.dev.vars'); } catch (e) {}
-    devServer.kill();
+    killDevServer();
     process.exit(1);
   }
 })();
