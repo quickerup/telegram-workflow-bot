@@ -32,6 +32,7 @@ const workflow = data.payload || data;
 const chatId = data.chat_id;
 const executionId = data.execution_id;
 const workerUrl = data.worker_url;
+const triggerData = data.trigger_data || null;
 
 const nodes = Array.isArray(workflow.nodes) ? workflow.nodes : [];
 const edges = Array.isArray(workflow.edges) ? workflow.edges : [];
@@ -121,7 +122,7 @@ function interpolate(value, nodeResults) {
   return value;
 }
 
-async function runNode(node, index, nodeResults) {
+async function runNode(node, index, nodeResults, triggerData) {
   const entry = { id: node.id, index, type: node.type, started_at: new Date().toISOString() };
 
   if (!ALLOWED_TYPES.has(node.type)) {
@@ -258,7 +259,7 @@ async function runNode(node, index, nodeResults) {
 
     let entry;
     try {
-      entry = await runNode(node, index++, nodeResults);
+      entry = await runNode(node, index++, nodeResults, triggerData);
       log.steps.push(entry);
       nodeResults[currentId] = entry;
       executed.add(currentId);

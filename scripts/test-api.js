@@ -34,6 +34,17 @@ async function request(options, body = null) {
 }
 
 (async () => {
+  console.log('Creating worker/.dev.vars for test environment...');
+  fs.writeFileSync('worker/.dev.vars', 'TELEGRAM_BOT_TOKEN=123456:fake-token\nTELEGRAM_WEBHOOK_SECRET=secret\nGITHUB_PAT=github_pat_fake\nALLOWED_CHAT_IDS=12345\n');
+
+  function cleanup() {
+    try {
+      if (fs.existsSync('worker/.dev.vars')) {
+        fs.unlinkSync('worker/.dev.vars');
+      }
+    } catch (e) {}
+  }
+
   console.log('Initializing local test D1 database schema...');
   try {
     execFileSync(

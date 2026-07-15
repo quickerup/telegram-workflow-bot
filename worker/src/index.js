@@ -1018,6 +1018,9 @@ function summarizeWorkflow(workflow) {
     else if (n.type === 'http') summary += `  - [${n.id}] http: ${n.config.method || 'GET'} ${n.config.url}\n`;
     else if (n.type === 'delay') summary += `  - [${n.id}] delay: ${n.config.ms}ms\n`;
     else if (n.type === 'notify') summary += `  - [${n.id}] notify: "${n.config.message}"\n`;
+    else if (n.type === 'webhook_trigger') summary += `  - [${n.id}] webhook_trigger: ${n.config.secret ? '(has secret)' : '(no secret)'}\n`;
+    else if (n.type === 'cron_trigger') summary += `  - [${n.id}] cron_trigger: "${n.config.cron}"\n`;
+    else if (n.type === 'telegram_event_trigger') summary += `  - [${n.id}] telegram_event_trigger: "${n.config.event_type}"\n`;
   });
   if (workflow.edges && workflow.edges.length > 0) {
     summary += `Edges:\n`;
