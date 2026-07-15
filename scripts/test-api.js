@@ -406,7 +406,7 @@ ALLOWED_CHAT_IDS=12345
       throw new Error(`Expected webhook trigger to attempt Actions dispatch, but got status ${resTriggerWebhook.statusCode} with body: ${JSON.stringify(resTriggerWebhook.body)}`);
     }
 
-    // 9a. Test Webhook trigger: request with invalid secret is rejected (401)
+    // 9a. Test Webhook trigger: request with invalid secret is rejected (403)
     console.log('Test 9a: Webhook trigger with invalid secret...');
     const resTriggerWebhookInvalid = await request({
       hostname: 'localhost',
@@ -419,12 +419,12 @@ ALLOWED_CHAT_IDS=12345
       }
     }, { test: "payload" });
 
-    if (resTriggerWebhookInvalid.statusCode !== 401) {
-      throw new Error(`Expected 401 for invalid secret, got ${resTriggerWebhookInvalid.statusCode}`);
+    if (resTriggerWebhookInvalid.statusCode !== 403) {
+      throw new Error(`Expected 403 for invalid secret, got ${resTriggerWebhookInvalid.statusCode}`);
     }
     console.log('Test 9a passed!');
 
-    // 9b. Test Webhook trigger: request with missing secret is rejected (401)
+    // 9b. Test Webhook trigger: request with missing secret is rejected (403)
     console.log('Test 9b: Webhook trigger with missing secret header...');
     const resTriggerWebhookMissing = await request({
       hostname: 'localhost',
@@ -436,8 +436,8 @@ ALLOWED_CHAT_IDS=12345
       }
     }, { test: "payload" });
 
-    if (resTriggerWebhookMissing.statusCode !== 401) {
-      throw new Error(`Expected 401 for missing secret, got ${resTriggerWebhookMissing.statusCode}`);
+    if (resTriggerWebhookMissing.statusCode !== 403) {
+      throw new Error(`Expected 403 for missing secret, got ${resTriggerWebhookMissing.statusCode}`);
     }
     console.log('Test 9b passed!');
 

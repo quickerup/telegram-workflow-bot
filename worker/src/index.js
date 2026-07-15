@@ -78,7 +78,7 @@ export default {
 
           if (!isAuthorized) {
             return new Response(JSON.stringify({ ok: false, error: 'Unauthorized: Invalid X-Workflow-Secret' }), {
-              status: 401,
+              status: 403,
               headers: { 'Content-Type': 'application/json' },
             });
           }
@@ -145,12 +145,30 @@ export default {
             new Date().toISOString()
           ).run();
 
+          // Sanitize the incoming trigger payload to ensure it is strictly treated as data
+          // and can never be interpreted as executable code/shell commands when passed to GitHub Actions.
+          const sanitizeValue = (val) => {
+            if (typeof val === 'string') {
+              return val.replace(/[;&|`$><\\\r\n]/g, '');
+            } else if (Array.isArray(val)) {
+              return val.map(sanitizeValue);
+            } else if (val !== null && typeof val === 'object') {
+              const cleanObj = {};
+              for (const [k, v] of Object.entries(val)) {
+                cleanObj[k] = sanitizeValue(v);
+              }
+              return cleanObj;
+            }
+            return val;
+          };
+
           // Force all notify dispatches to resolve the chat_id exclusively from server-side stored owner data
           let triggerPayload = null;
           try {
             triggerPayload = await request.json().catch(() => null);
             if (triggerPayload && typeof triggerPayload === 'object') {
               delete triggerPayload.chat_id;
+              triggerPayload = sanitizeValue(triggerPayload);
             }
           } catch (e) {}
 
