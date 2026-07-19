@@ -16,4 +16,4 @@ jobs:
           curl -s -X POST https://api.telegram.org/bot$TOKEN/sendDocument \
           -d chat_id=$CHAT -d document="$URL" \
           -d caption="Broadcast Successful" \
-          -d reply_markup='{"inline_keyboard": [[{"text": "🔄 Next", "callback_data": "/trigger quickerup/telegram-worker-bot-template bot_mrriebor.yml main"}]]}'
+          -d reply_markup="$(printf '{"inline_keyboard": [[{"text": "🔄 Next", "callback_data": "/trigger %s bot_mrriebor.yml %s"}]]}' "$GITHUB_REPOSITORY" "${GITHUB_REF_NAME:-main}")"
