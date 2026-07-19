@@ -1725,6 +1725,7 @@ async function handleBrowserCallback(env, chatId, callbackQuery) {
   if (data.startsWith('wf_sel:')) {
     const workflowId = data.substring(7);
     await startBrowsing(env, chatId, workflowId, callbackQuery.message.message_id);
+    await answerCallbackQuery(env, callbackQuery.id, { text: "Workflow opened." });
     return;
   }
 
@@ -2099,13 +2100,17 @@ async function sendMessage(env, chatId, text, replyMarkup = null) {
   }
 }
 
-async function answerCallbackQuery(env, callbackQueryId) {
+async function answerCallbackQuery(env, callbackQueryId, options = {}) {
   if (!env.TELEGRAM_BOT_TOKEN) return;
+  const body = {
+    callback_query_id: callbackQueryId,
+    ...options
+  };
   try {
     const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ callback_query_id: callbackQueryId }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) {
       console.error(`Telegram answerCallbackQuery failed with status ${res.status}: ${await res.text()}`);
