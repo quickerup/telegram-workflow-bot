@@ -2135,6 +2135,10 @@ function inferTelegramMediaType(url) {
   return 'document';
 }
 
+function getRandomMediaCallbackData(token) {
+  return `rm_next:${token}`;
+}
+
 function pickRandomMediaItem(items, previousIndex = -1) {
   if (items.length === 0) return { item: null, index: -1 };
   if (items.length === 1) return { item: items[0], index: 0 };
@@ -2270,7 +2274,7 @@ async function sendRandomMedia(env, chatId, items, options = {}) {
 
   const replyMarkup = {
     inline_keyboard: [[
-      { text: options.buttonText || '🎲 Next random media', callback_data: `random_media:next:${token}` }
+      { text: options.buttonText || '🎲 Next random media', callback_data: getRandomMediaCallbackData(token) }
     ]]
   };
 
@@ -2309,7 +2313,7 @@ async function handleRandomMediaCallback(env, chatId, callbackQuery) {
 
   const replyMarkup = {
     inline_keyboard: [[
-      { text: state.button_text || '🎲 Next random media', callback_data: `random_media:next:${token}` }
+      { text: state.button_text || '🎲 Next random media', callback_data: getRandomMediaCallbackData(token) }
     ]]
   };
 
