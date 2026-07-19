@@ -1,0 +1,58 @@
+name: Multi-Media Broadcast
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload_json:
+        description: 'Full graph workflow JSON for a manual multi-media broadcast run'
+        required: false
+        default: '{"name":"multi-media-broadcast","nodes":[{"id":"manual_notify","type":"notify","position":{"x":100,"y":100},"config":{"message":"Manual Multi-Media Broadcast test run."}}],"edges":[]}'
+
+concurrency:
+  group: multi-media-broadcast
+  cancel-in-progress: false
+
+jobs:
+  broadcast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Write manual payload to file
+        run: |
+          cat > payload.json <<'PAYLOAD_EOF'
+          ${{ inputs.payload_json }}
+          PAYLOAD_EOF
+
+      - name: Extract and validate workflow
+        run: |
+          node -e "
+            const fs = require('fs');
+            const raw = JSON.parse(fs.readFileSync('payload.json', 'utf8'));
+            const workflow = raw.payload || raw;
+            fs.writeFileSync('workflow.json', JSON.stringify(workflow));
+          "
+          node scripts/validate.js workflow.json
+
+      - name: Run executor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: node scripts/executor.js payload.json
+
+      - name: Commit execution log
+        if: always()
+        run: |
+          git config user.name "workflow-bot"
+          git config user.email "workflow-bot@users.noreply.github.com"
+          git add executions/
+          git diff --cached --quiet || git commit -m "Log multi-media broadcast [skip ci]"
+          git push
