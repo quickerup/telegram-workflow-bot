@@ -17,6 +17,20 @@ executions/*.json  ── committed to the repo, and a final status is sent back
 ```
 
 
+## Manual multi-media broadcast trigger
+
+The `Multi-Media Broadcast` workflow can be started from the GitHub Actions UI
+because `.github/workflows/bot_multi_media_broadcast.yml` includes a
+`workflow_dispatch` trigger. GitHub only exposes manual dispatch for workflow
+files that are present on the repository's default branch, so template users must
+pull the latest template workflow into their target repository's `main` branch
+before trying to trigger `bot_multi_media_broadcast.yml` manually.
+
+If Telegram reports that `Multi-Media Broadcast` cannot be triggered manually,
+verify that the target repository and branch shown in the bot message contain the
+current `.github/workflows/bot_multi_media_broadcast.yml` file with both
+`repository_dispatch` and `workflow_dispatch` under `on:`.
+
 ## Step types
 
 | type   | fields                                              | notes                          |
