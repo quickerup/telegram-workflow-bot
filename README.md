@@ -16,6 +16,7 @@ GitHub Actions (repository_dispatch)  ── runs each step in order
 executions/*.json  ── committed to the repo, and a final status is sent back to Telegram
 ```
 
+
 ## Step types
 
 | type   | fields                                              | notes                          |
