@@ -1,6 +1,6 @@
 name: Workflow Executor
 
-on:
+'on':
   repository_dispatch:
     types: [run-workflow]
   workflow_dispatch:

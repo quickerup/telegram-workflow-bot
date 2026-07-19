@@ -1,6 +1,6 @@
 name: Multi-Media Broadcast
 
-on:
+'on':
   repository_dispatch:
     types: [multi-media-broadcast]
   workflow_dispatch:
