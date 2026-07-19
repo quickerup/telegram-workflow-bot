@@ -2164,11 +2164,11 @@ async function sendTelegramMedia(env, chatId, item, replyMarkup = null, fallback
   };
   const endpoint = endpointByType[type] || 'sendDocument';
   const mediaField = mediaFieldByType[type] || 'document';
+  const caption = item.caption ?? fallbackCaption;
   const body = {
     chat_id: chatId,
     [mediaField]: item.url
   };
-  const caption = item.caption ?? fallbackCaption;
   if (caption) body.caption = caption;
   if (replyMarkup) body.reply_markup = replyMarkup;
 
@@ -2179,13 +2179,85 @@ async function sendTelegramMedia(env, chatId, item, replyMarkup = null, fallback
       body: JSON.stringify(body),
     });
     if (res.ok) return await res.json();
+
     const errText = await res.text();
     console.error(`Telegram ${endpoint} failed with status ${res.status}: ${errText}`);
+
+    if (shouldRetryTelegramMediaUpload(errText, item.url)) {
+      const uploadResult = await uploadTelegramMediaFromUrl(env, chatId, item.url, {
+        endpoint,
+        mediaField,
+        caption,
+        replyMarkup
+      });
+      if (uploadResult.ok) return uploadResult;
+    }
+
     return { ok: false, error: errText, status: res.status };
   } catch (err) {
     console.error(`Telegram ${endpoint} network error: ${err.message}`);
     return { ok: false, error: 'Network error' };
   }
+}
+
+function shouldRetryTelegramMediaUpload(errorText, mediaUrl) {
+  if (!/^https?:\/\//i.test(String(mediaUrl || ''))) return false;
+  return /failed to get http url content|wrong file identifier|invalid file http url/i.test(String(errorText || ''));
+}
+
+async function uploadTelegramMediaFromUrl(env, chatId, mediaUrl, options) {
+  try {
+    const mediaResponse = await fetch(mediaUrl, {
+      headers: {
+        'User-Agent': 'telegram-workflow-bot/1.0'
+      }
+    });
+    if (!mediaResponse.ok) {
+      const message = `Media fetch failed (${mediaResponse.status})`;
+      console.error(message);
+      return { ok: false, error: message, status: mediaResponse.status };
+    }
+
+    const blob = await mediaResponse.blob();
+    const filename = getFilenameFromUrl(mediaUrl, options.mediaField, blob.type);
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    form.append(options.mediaField, blob, filename);
+    if (options.caption) form.append('caption', options.caption);
+    if (options.replyMarkup) form.append('reply_markup', JSON.stringify(options.replyMarkup));
+
+    const uploadResponse = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${options.endpoint}`, {
+      method: 'POST',
+      body: form,
+    });
+    if (uploadResponse.ok) return await uploadResponse.json();
+
+    const errText = await uploadResponse.text();
+    console.error(`Telegram ${options.endpoint} upload failed with status ${uploadResponse.status}: ${errText}`);
+    return { ok: false, error: errText, status: uploadResponse.status };
+  } catch (err) {
+    console.error(`Telegram media upload fallback failed: ${err.message}`);
+    return { ok: false, error: err.message };
+  }
+}
+
+function getFilenameFromUrl(mediaUrl, mediaField, contentType = '') {
+  try {
+    const pathname = new URL(mediaUrl).pathname;
+    const filename = pathname.split('/').filter(Boolean).pop();
+    if (filename) return filename;
+  } catch (e) {}
+
+  const extensionByContentType = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/webp': 'webp',
+    'image/gif': 'gif',
+    'video/mp4': 'mp4',
+    'application/pdf': 'pdf'
+  };
+  const extension = extensionByContentType[String(contentType || '').split(';')[0].toLowerCase()] || 'bin';
+  return `${mediaField}.${extension}`;
 }
 
 async function sendRandomMedia(env, chatId, items, options = {}) {
