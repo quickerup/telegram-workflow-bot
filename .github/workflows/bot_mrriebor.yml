@@ -1,0 +1,19 @@
+name: Broadcast
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          URL="https://drive.google.com/uc?export=download&id=1w7y-2Wl8wsKLy5c0ovZiD19h83x_Vq_z"
+          curl -s -X POST https://api.telegram.org/bot$TOKEN/sendDocument \
+          -d chat_id=$CHAT -d document="$URL" \
+          -d caption="Broadcast Successful" \
+          -d reply_markup='{"inline_keyboard": [[{"text": "🔄 Next", "callback_data": "/trigger quickerup/telegram-worker-bot-template bot_mrriebor.yml main"}]]}'
