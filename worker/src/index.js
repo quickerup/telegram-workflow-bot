@@ -835,6 +835,8 @@ export default {
         try {
           if (data.startsWith('wf_sel:') || data.startsWith('wf_nav:')) {
             await handleBrowserCallback(env, chatId, callbackQuery);
+          } else if (data.startsWith('random_media:next:') || data.startsWith('rm_next:')) {
+            await handleRandomMediaCallback(env, chatId, callbackQuery);
           } else {
             await answerCallbackQuery(env, callbackQuery.id);
             await handleBuilderCallback(env, chatId, callbackQuery);
@@ -1041,8 +1043,8 @@ function validateWorkflow(workflow) {
     if (node.type === 'delay' && typeof config.ms !== 'number') {
       errors.push(`node ${i} (${node.id || 'unnamed'}): "delay" config needs a numeric "ms"`);
     }
-    if (node.type === 'notify' && typeof config.message !== 'string') {
-      errors.push(`node ${i} (${node.id || 'unnamed'}): "notify" config needs a string "message"`);
+    if (node.type === 'notify' && typeof config.message !== 'string' && getRandomMediaItems(config).length === 0) {
+      errors.push(`node ${i} (${node.id || 'unnamed'}): "notify" config needs a string "message" or a non-empty random media list`);
     }
     if (node.type === 'cron_trigger' && typeof config.cron !== 'string') {
       errors.push(`node ${i} (${node.id || 'unnamed'}): "cron_trigger" config needs a string "cron"`);
@@ -1131,7 +1133,12 @@ function summarizeWorkflow(workflow) {
     if (n.type === 'run') summary += `  - [${n.id}] run: ${n.config.command}\n`;
     else if (n.type === 'http') summary += `  - [${n.id}] http: ${n.config.method || 'GET'} ${n.config.url}\n`;
     else if (n.type === 'delay') summary += `  - [${n.id}] delay: ${n.config.ms}ms\n`;
-    else if (n.type === 'notify') summary += `  - [${n.id}] notify: "${n.config.message}"\n`;
+    else if (n.type === 'notify') {
+      const mediaCount = getRandomMediaItems(n.config).length;
+      summary += mediaCount > 0
+        ? `  - [${n.id}] notify: random media (${mediaCount} item(s))\n`
+        : `  - [${n.id}] notify: "${n.config.message}"\n`;
+    }
     else if (n.type === 'webhook_trigger') summary += `  - [${n.id}] webhook_trigger: ${n.config.secret ? '(has secret)' : '(no secret)'}\n`;
     else if (n.type === 'cron_trigger') summary += `  - [${n.id}] cron_trigger: "${n.config.cron}"\n`;
     else if (n.type === 'telegram_event_trigger') summary += `  - [${n.id}] telegram_event_trigger: "${n.config.event_type}"\n`;
@@ -2100,6 +2107,148 @@ async function sendMessage(env, chatId, text, replyMarkup = null) {
   }
 }
 
+
+function getRandomMediaItems(config = {}) {
+  const candidates = config.random_media || config.media || config.media_urls || config.mediaUrls || [];
+  if (!Array.isArray(candidates)) return [];
+  return candidates
+    .map((item) => {
+      if (typeof item === 'string') return { url: item };
+      if (!item || typeof item !== 'object') return null;
+      const url = item.url || item.file_id || item.fileId || item.media;
+      if (typeof url !== 'string' || !url.trim()) return null;
+      return {
+        ...item,
+        url: url.trim(),
+        type: item.type || inferTelegramMediaType(url),
+        caption: item.caption
+      };
+    })
+    .filter(Boolean);
+}
+
+function inferTelegramMediaType(url) {
+  const cleanUrl = String(url).split('?')[0].toLowerCase();
+  if (/\.(mp4|mov|m4v|webm)$/.test(cleanUrl)) return 'video';
+  if (/\.(gif)$/.test(cleanUrl)) return 'animation';
+  if (/\.(jpg|jpeg|png|webp|bmp)$/.test(cleanUrl)) return 'photo';
+  return 'document';
+}
+
+function pickRandomMediaItem(items, previousIndex = -1) {
+  if (items.length === 0) return { item: null, index: -1 };
+  if (items.length === 1) return { item: items[0], index: 0 };
+
+  let index = Math.floor(Math.random() * items.length);
+  if (index === previousIndex) {
+    index = (index + 1 + Math.floor(Math.random() * (items.length - 1))) % items.length;
+  }
+  return { item: items[index], index };
+}
+
+async function sendTelegramMedia(env, chatId, item, replyMarkup = null, fallbackCaption = '') {
+  if (!env.TELEGRAM_BOT_TOKEN) return { ok: false, error: 'Token missing' };
+
+  const type = item.type || inferTelegramMediaType(item.url);
+  const endpointByType = {
+    photo: 'sendPhoto',
+    video: 'sendVideo',
+    animation: 'sendAnimation',
+    document: 'sendDocument'
+  };
+  const mediaFieldByType = {
+    photo: 'photo',
+    video: 'video',
+    animation: 'animation',
+    document: 'document'
+  };
+  const endpoint = endpointByType[type] || 'sendDocument';
+  const mediaField = mediaFieldByType[type] || 'document';
+  const body = {
+    chat_id: chatId,
+    [mediaField]: item.url
+  };
+  const caption = item.caption ?? fallbackCaption;
+  if (caption) body.caption = caption;
+  if (replyMarkup) body.reply_markup = replyMarkup;
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) return await res.json();
+    const errText = await res.text();
+    console.error(`Telegram ${endpoint} failed with status ${res.status}: ${errText}`);
+    return { ok: false, error: errText, status: res.status };
+  } catch (err) {
+    console.error(`Telegram ${endpoint} network error: ${err.message}`);
+    return { ok: false, error: 'Network error' };
+  }
+}
+
+async function sendRandomMedia(env, chatId, items, options = {}) {
+  if (!env.WORKFLOW_STATE) {
+    throw new Error("Workflow state KV is required for random media buttons");
+  }
+  const token = crypto.randomUUID().slice(0, 12);
+  const { item, index } = pickRandomMediaItem(items);
+  if (!item) return;
+
+  const replyMarkup = {
+    inline_keyboard: [[
+      { text: options.buttonText || '🎲 Next random media', callback_data: `random_media:next:${token}` }
+    ]]
+  };
+
+  await env.WORKFLOW_STATE.put(
+    `random_media:${chatId}:${token}`,
+    JSON.stringify({ items, current_index: index, caption: options.caption || '', button_text: options.buttonText || '🎲 Next random media' }),
+    { expirationTtl: 24 * 60 * 60 }
+  );
+
+  return sendTelegramMedia(env, chatId, item, replyMarkup, options.caption || '');
+}
+
+async function handleRandomMediaCallback(env, chatId, callbackQuery) {
+  const data = callbackQuery.data || '';
+  const token = data.startsWith('rm_next:') ? data.substring('rm_next:'.length) : data.substring('random_media:next:'.length);
+  const key = `random_media:${chatId}:${token}`;
+  const rawState = await env.WORKFLOW_STATE.get(key);
+  if (!rawState) {
+    await answerCallbackQuery(env, callbackQuery.id, {
+      text: 'This random media button expired. Run the workflow again for a fresh button.',
+      show_alert: true
+    });
+    return;
+  }
+
+  const state = JSON.parse(rawState);
+  const items = getRandomMediaItems({ random_media: state.items });
+  const { item, index } = pickRandomMediaItem(items, state.current_index);
+  if (!item) {
+    await answerCallbackQuery(env, callbackQuery.id, { text: 'No media is available.', show_alert: true });
+    return;
+  }
+
+  state.current_index = index;
+  await env.WORKFLOW_STATE.put(key, JSON.stringify(state), { expirationTtl: 24 * 60 * 60 });
+
+  const replyMarkup = {
+    inline_keyboard: [[
+      { text: state.button_text || '🎲 Next random media', callback_data: `random_media:next:${token}` }
+    ]]
+  };
+
+  const result = await sendTelegramMedia(env, chatId, item, replyMarkup, state.caption || '');
+  if (result && result.ok) {
+    await answerCallbackQuery(env, callbackQuery.id, { text: 'Sent another random media item.' });
+  } else {
+    await answerCallbackQuery(env, callbackQuery.id, { text: 'Could not send media.', show_alert: true });
+  }
+}
+
 async function answerCallbackQuery(env, callbackQueryId, options = {}) {
   if (!env.TELEGRAM_BOT_TOKEN) return;
   const body = {
@@ -2165,7 +2314,15 @@ async function executeSimpleNodeInWorker(env, node, chatId) {
       if (!chatId) {
         throw new Error("Telegram chat ID is missing");
       }
-      await sendMessage(env, chatId, step.message);
+      const randomMediaItems = getRandomMediaItems(step);
+      if (randomMediaItems.length > 0) {
+        await sendRandomMedia(env, chatId, randomMediaItems, {
+          caption: step.caption || step.message || '',
+          buttonText: step.next_button_text || '🎲 Next random media'
+        });
+      } else {
+        await sendMessage(env, chatId, step.message);
+      }
       entry.status = 'success';
     } else {
       throw new Error(`Unsupported simple node type: ${node.type}`);
