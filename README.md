@@ -31,6 +31,11 @@ verify that the target repository and branch shown in the bot message contain th
 current `.github/workflows/bot_multi_media_broadcast.yml` file with both
 `repository_dispatch` and `workflow_dispatch` under `on:`.
 
+Broadcast workflow buttons should also point at the repository and branch that
+created the Telegram message. Avoid hard-coded template repository names in
+`callback_data`, because the manual trigger check runs against the repository
+shown in the bot message.
+
 ## Step types
 
 | type   | fields                                              | notes                          |
