@@ -1,6 +1,8 @@
 name: Multi-Media Broadcast
 
 on:
+  repository_dispatch:
+    types: [multi-media-broadcast]
   workflow_dispatch:
     inputs:
       payload_json:
@@ -27,7 +29,15 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Write manual payload to file
+      - name: Write payload to file (repository_dispatch)
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          cat > payload.json << 'PAYLOAD_EOF'
+          ${{ toJson(github.event.client_payload) }}
+          PAYLOAD_EOF
+
+      - name: Write payload to file (workflow_dispatch / manual)
+        if: github.event_name == 'workflow_dispatch'
         run: |
           cat > payload.json <<'PAYLOAD_EOF'
           ${{ inputs.payload_json }}
